@@ -24,6 +24,45 @@ from functools import wraps
 import MetaTrader5 as mt5
 import pytz
 from flask import Flask, jsonify, request, Response
+
+# ============== 时区 ==============
+# 全系统对外展示统一用北京时区。MT5 历史查询的边界（start/end）按 broker
+# 服务器 TZ 决定，但用户看到的所有「时间字符串」都是 Asia/Shanghai。
+# 之前混用 datetime.now()（裸的，依赖 host TZ）和 pytz Etc/UTC 导致微信
+# 推送的时间错位。
+BJ_TZ = pytz.timezone("Asia/Shanghai")
+
+
+def _now_bj() -> datetime:
+    """当前北京时间（aware datetime，tzinfo=Asia/Shanghai）。"""
+    return datetime.now(BJ_TZ)
+
+
+def _now_bj_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """当前北京时间的字符串表示，默认 'YYYY-MM-DD HH:MM:SS'。"""
+    return _now_bj().strftime(fmt)
+
+
+def _bj_date_str() -> str:
+    """今天的北京日期 YYYY-MM-DD（用于日志文件名 / log 过滤）。"""
+    return _now_bj().strftime("%Y-%m-%d")
+
+
+def _ts_to_bj_str(ts, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """把 unix 时间戳（秒，int 或 float）格式化成北京时间字符串。
+    None / 0 / 不可解析 → 空字符串。"""
+    if ts is None:
+        return ""
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(int(ts), tz=BJ_TZ).strftime(fmt)
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = pytz.utc.localize(ts)
+            return ts.astimezone(BJ_TZ).strftime(fmt)
+    except Exception:
+        return ""
+    return ""
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -124,12 +163,86 @@ class TradingContext:
         self.is_open_position = False
 
         # Initialize MT5 connection — must happen before loading set/profile
-        # so that mt5.terminal_info() and mt5.symbol_info() are available
-        if not mt5.initialize():
-            logging.error("MT5初始化失败")
-            print("MT5初始化失败")
+        # so that mt5.terminal_info() and mt5.symbol_info() are available.
+        #
+        # 多实例消歧：用户开了几个 MT5（实盘 + 副本回测）时，
+        # mt5.initialize() 不带 path 会随机抓一个 — 命中错的话查盘 / 下单
+        # 都会落到错的账号上。显式把 EASYDEAL_MT5_INSTALL_DIR 里的
+        # terminal64.exe 路径传进去就锁定了客户端「实盘 MT5」配置项指向
+        # 的那个实例。
+        # 候选名：terminal64.exe 普通名 / 32 位老版 terminal.exe。
+        # （旧版本曾把副本改名成 terminal64_backtest.exe，但 MT5 自检不允许
+        # 改名启动会立即 ExitCode 10001 退出，客户端已经反向迁移回原名。）
+        init_kwargs = {}
+        install_dir = os.getenv("EASYDEAL_MT5_INSTALL_DIR")
+        if install_dir:
+            for cand in ("terminal64.exe", "terminal.exe"):
+                p = os.path.join(install_dir, cand)
+                if os.path.isfile(p):
+                    init_kwargs["path"] = p
+                    logging.info(f"MT5 initialize 锁定到 {p}")
+                    break
+        if not mt5.initialize(**init_kwargs):
+            err = mt5.last_error() if hasattr(mt5, "last_error") else "unknown"
+            logging.error(f"MT5初始化失败 path={init_kwargs.get('path')} err={err}")
+            print(f"MT5初始化失败 path={init_kwargs.get('path')} err={err}")
             self.running = False
             return
+
+        # 多 MT5 场景 SDK 不一定听 path — attach 后验证 terminal_info().path
+        # 跟我们要求的一致没。不一致就 shutdown + retry，最多 5 次。
+        # 注意：mt5.terminal_info().path 返回的是 install 目录（无 .exe），
+        # 我们的 init_kwargs['path'] 是 install_dir/terminal64.exe — 比较前
+        # 必须把 .exe 剥掉，否则永远不相等 → 触发 self.running=False 死锁。
+        requested_path = init_kwargs.get("path")
+        if requested_path:
+            import time as _time
+            def _norm_dir(p):
+                """归一化为目录形式 — 全小写、反斜杠、剥 .exe、去末尾分隔符。
+                terminal_info().path 是 install dir；我们的 path 是 .exe 全路径，
+                必须先剥成同一形式才能比对。"""
+                s = str(p or "").lower().replace("/", "\\")
+                if s.endswith(".exe"):
+                    s = os.path.dirname(s)
+                return s.rstrip("\\")
+            expected_dir = _norm_dir(requested_path)
+            for attempt in range(6):
+                try:
+                    ti = mt5.terminal_info()
+                    actual = ti.path if ti else None
+                except Exception:
+                    actual = None
+                if _norm_dir(actual) == expected_dir:
+                    if attempt > 0:
+                        logging.info(f"MT5 SDK 绑到正确实例（重试 {attempt} 次后）")
+                    break
+                logging.warning(
+                    f"MT5 SDK attached dir={actual} but expected dir={expected_dir} "
+                    f"(attempt {attempt+1}/6)"
+                )
+                if attempt < 5:
+                    try:
+                        mt5.shutdown()
+                    except Exception:
+                        pass
+                    _time.sleep(0.5)
+                    if not mt5.initialize(**init_kwargs):
+                        logging.error(f"MT5 重试 init 失败：{mt5.last_error()}")
+                        # 这里不能 self.running=False — 重试 init 失败可能是
+                        # 暂时的，让 SDK 当前的连接（虽然可能绑错）保持。后面的
+                        # symbol_info / account_info 走 SDK 自己处理。
+                        break
+            else:
+                # 6 次都没绑对 — log + warning 但不杀 MCP。多 MT5 + SDK 路径绑定
+                # 不可靠是真问题，但即使绑到「错的」MT5（同 broker 同账号的另一个
+                # 实例）大部分功能仍能用。强行 self.running=False 会让所有查账号 /
+                # 持仓 / 行情都炸，副作用比绑错本身大得多。让 Claude 看到具体
+                # symbol_info=None 错误时再引导用户处理。
+                logging.warning(
+                    f"MT5 SDK 绑路径不一致：期望 {expected_dir}，实际 {_norm_dir(actual)}。"
+                    f"继续用 SDK 当前连接（可能是用户多 MT5 导致的），如果后续 symbol_info "
+                    f"等查询失败，会在那里给具体错误。"
+                )
 
         # Baseline params: prefer MT5 chart profile (.chr), fallback to EA source defaults
         chart_params = _load_params_from_chart_profiles()
@@ -435,7 +548,7 @@ class TradingContext:
                 "bid": symbol_info.bid,
                 "ask": symbol_info.ask,
                 "spread": symbol_info.spread,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "time": _now_bj_str()
             },
             "strategy_state": {
                 "running": self.running,
@@ -540,10 +653,9 @@ class TradingContext:
 
             hourly_profits = {}
             for deal in strategy_deals:
-                deal_time = deal.time
-                if isinstance(deal_time, int):
-                    deal_time = datetime.fromtimestamp(deal_time)
-                hour = deal_time.strftime("%Y-%m-%d %H:00:00")
+                # 把 MT5 deal.time（unix 秒）按北京时间分桶到小时；
+                # 用户在「3 点的盈亏」里看到的「3 点」就是北京时间的 3 点。
+                hour = _ts_to_bj_str(deal.time, "%Y-%m-%d %H:00:00")
                 if hour not in hourly_profits:
                     hourly_profits[hour] = 0
                 hourly_profits[hour] += deal.profit
@@ -565,7 +677,7 @@ class TradingContext:
                 "hourly_profits": [{"time": k, "profit": v} for k, v in hourly_profits.items()],
                 "deals": [{
                     "ticket": deal.ticket,
-                    "time": datetime.fromtimestamp(deal.time).strftime("%Y-%m-%d %H:%M:%S") if isinstance(deal.time, int) else deal.time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "time": _ts_to_bj_str(deal.time),
                     "type": "BUY" if deal.type == mt5.DEAL_TYPE_BUY else "SELL",
                     "volume": deal.volume,
                     "price": deal.price,
@@ -951,7 +1063,7 @@ class TradingMonitor:
         self.last_alert_time[alert_key] = now
 
         event = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": _now_bj().isoformat(),
             "event_type": event_type,
             "level": level,
             "message": message,
@@ -1572,6 +1684,150 @@ def get_strategy():
     return strategy_instance
 
 
+# ---------------------------------------------------------------------------
+# 设置热重载
+#
+# easydeal_settings_mcp_server 改 settings.json 后，这边在下一次工具调用前
+# 通过 mtime 检测 reload —— Claude / 用户不用重启会话也不用重启客户端。
+#
+# 触发条件：EASYDEAL_SETTINGS_PATH 环境变量已注 + 文件 mtime 变了。
+# 副作用：
+#   1. monitor.symbols / magicNumbers / commentContains / commentExcludes
+#      → 同步到 strategy_instance（self.symbols / self.magic_numbers / ...）
+#   2. mt5.installDir 跟当前 SDK 绑的 install dir 不一致 →
+#      mt5.shutdown() + 重新 initialize(path=新 .exe) + 重试绑定循环
+# ---------------------------------------------------------------------------
+
+_settings_path = os.getenv("EASYDEAL_SETTINGS_PATH")
+_settings_last_mtime = 0.0
+
+
+def _norm_install_dir(p) -> str:
+    """terminal_info().path 是 install dir（无 .exe）；我们的 path 是 exe 全路径。
+    比对前都剥成 install dir 形式，参考 mt5_probe.py / TradingContext.__init__。"""
+    s = str(p or "").lower().replace("/", "\\")
+    if s.endswith(".exe"):
+        s = os.path.dirname(s)
+    return s.rstrip("\\")
+
+
+def _rebind_mt5(new_install_dir: str) -> bool:
+    """对应 settings 改了 installDir 后调一次：mt5.shutdown() + initialize(path=新)
+    + 6 次绑定校验。返回是否最终绑到了 new_install_dir。"""
+    init_kwargs = {}
+    for cand in ("terminal64.exe", "terminal.exe"):
+        p = os.path.join(new_install_dir, cand)
+        if os.path.isfile(p):
+            init_kwargs["path"] = p
+            break
+    if "path" not in init_kwargs:
+        logging.warning(f"[settings reload] {new_install_dir} 下没有 terminal64.exe / terminal.exe，跳过 rebind")
+        return False
+    try:
+        mt5.shutdown()
+    except Exception:
+        pass
+    if not mt5.initialize(**init_kwargs):
+        logging.error(f"[settings reload] mt5.initialize 失败 path={init_kwargs['path']} err={mt5.last_error()}")
+        return False
+    expected = _norm_install_dir(init_kwargs["path"])
+    import time as _time
+    for attempt in range(6):
+        try:
+            ti = mt5.terminal_info()
+            actual = ti.path if ti else None
+        except Exception:
+            actual = None
+        if _norm_install_dir(actual) == expected:
+            logging.info(f"[settings reload] MT5 已绑到 {new_install_dir}（attempt {attempt}）")
+            return True
+        if attempt < 5:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            _time.sleep(0.5)
+            if not mt5.initialize(**init_kwargs):
+                logging.error(f"[settings reload] retry init 失败：{mt5.last_error()}")
+                return False
+    logging.warning(
+        f"[settings reload] 6 次重试后仍未绑到 {new_install_dir}（actual={actual}），"
+        "保持 SDK 当前连接 —— 后续 symbol_info 失败时再让 Claude 引导处理"
+    )
+    return False
+
+
+def _maybe_reload_settings() -> None:
+    """每次工具调用前 cheap check：settings.json 的 mtime 变了就重读。"""
+    global _settings_last_mtime
+    if not _settings_path or not os.path.isfile(_settings_path):
+        return
+    try:
+        mtime = os.path.getmtime(_settings_path)
+    except OSError:
+        return
+    if mtime <= _settings_last_mtime:
+        return
+    _settings_last_mtime = mtime
+
+    try:
+        with open(_settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception as e:
+        logging.warning(f"[settings reload] 读 {_settings_path} 失败：{e}")
+        return
+
+    s = strategy_instance
+    if s is None:
+        return  # init 还没跑完，先放过；等 init 完后下次调用再 reload
+
+    # 1. MT5 install dir 变化 → 重新绑定 SDK
+    new_install = ((data.get("mt5") or {}).get("installDir") or "").strip()
+    if new_install:
+        try:
+            ti = mt5.terminal_info()
+            cur = ti.path if ti else None
+        except Exception:
+            cur = None
+        if _norm_install_dir(cur) != _norm_install_dir(new_install):
+            logging.info(f"[settings reload] MT5 installDir 变了：{cur} → {new_install}，开始重绑")
+            _rebind_mt5(new_install)
+
+    # 2. monitor.* → strategy_instance 同步
+    monitor = data.get("monitor") or {}
+    syms = monitor.get("symbols")
+    if isinstance(syms, list):
+        cleaned = [x for x in syms if isinstance(x, str) and x.strip()]
+        if cleaned and cleaned != s.symbols:
+            s.symbols = cleaned
+            s.symbol = cleaned[0]
+            logging.info(f"[settings reload] 监控品种更新为：{cleaned}")
+    magics = monitor.get("magicNumbers")
+    if isinstance(magics, list):
+        out = []
+        for m in magics:
+            try:
+                out.append(int(m))
+            except (TypeError, ValueError):
+                pass
+        if out and out != s.magic_numbers:
+            s.magic_numbers = out
+            s.magic_number = out[0]
+            logging.info(f"[settings reload] magic numbers 更新为：{out}")
+    cc = monitor.get("commentContains")
+    if isinstance(cc, list):
+        new_cc = [str(x) for x in cc]
+        if new_cc != s.comment_contains:
+            s.comment_contains = new_cc
+            logging.info(f"[settings reload] commentContains 更新为：{new_cc}")
+    ce = monitor.get("commentExcludes")
+    if isinstance(ce, list):
+        new_ce = [str(x) for x in ce]
+        if new_ce != s.comment_excludes:
+            s.comment_excludes = new_ce
+            logging.info(f"[settings reload] commentExcludes 更新为：{new_ce}")
+
+
 def _get_strategy_doc_path(date: datetime | None = None) -> str:
     path = os.getenv("EA_STRATEGY_DOC_PATH")
     if path:
@@ -2177,7 +2433,7 @@ def _strategy_consistency_review_loop() -> None:
 
 def generate_strategy_documentation(strategy, arguments: dict = None) -> tuple:
     arguments = arguments or {}
-    date_prefix = datetime.now().strftime("%Y-%m-%d")
+    date_prefix = _bj_date_str()
 
     order_logs = _read_recent_lines(
         log_file,
@@ -2865,7 +3121,7 @@ def _save_backup_manifest(entries: list[dict]) -> None:
 def _backup_strategy(change_note: str = "") -> str:
     """Create a timestamped backup with optional change note. Returns backup path."""
     src = _get_strategy_file_path()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = _now_bj().strftime("%Y%m%d_%H%M%S")
     backup_dir = _get_backup_dir()
     ea_basename = os.path.basename(src)
     dst = os.path.join(backup_dir, f"{ea_basename}.{ts}.bak")
@@ -2874,7 +3130,7 @@ def _backup_strategy(change_note: str = "") -> str:
     # Update manifest
     manifest = _load_backup_manifest()
     manifest.append({
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": _now_bj_str(),
         "file": os.path.basename(dst),
         "source": ea_basename,
         "change_note": change_note or "",
@@ -2884,19 +3140,34 @@ def _backup_strategy(change_note: str = "") -> str:
 
 
 def _get_metaeditor_path() -> str:
-    """Get MetaEditor64.exe path from MT5 itself.
+    """Get MetaEditor64.exe path.
 
     Resolution order:
     1. METAEDITOR_PATH env var (manual override)
-    2. mt5.terminal_info().path (MT5 installation directory, reported by MT5)
+    2. EASYDEAL_MT5_INSTALL_DIR env var (set by easydeal-client) — works
+       even when MT5 is not running, which is the common case for
+       chat-driven EA creation.
+    3. mt5.terminal_info().path (only if MT5 is currently initialised)
     """
     env_path = os.getenv("METAEDITOR_PATH")
     if env_path and os.path.isfile(env_path):
         return env_path
 
-    info = mt5.terminal_info()
-    if info and info.path:
-        return os.path.join(info.path, "MetaEditor64.exe")
+    install_dir = os.getenv("EASYDEAL_MT5_INSTALL_DIR")
+    if install_dir:
+        for name in ("MetaEditor64.exe", "metaeditor64.exe", "MetaEditor.exe"):
+            candidate = os.path.join(install_dir, name)
+            if os.path.isfile(candidate):
+                return candidate
+
+    try:
+        info = mt5.terminal_info()
+        if info and info.path:
+            candidate = os.path.join(info.path, "MetaEditor64.exe")
+            if os.path.isfile(candidate):
+                return candidate
+    except Exception:
+        pass
 
     return ""
 
@@ -3110,14 +3381,25 @@ def get_all_tools() -> list[Tool]:
         Tool(
             name="compile_strategy",
             description=(
-                "【开发期编译工具 · 非查询工具】调用 MetaEditor64 对当前 EA .mq5 源代码做语法编译，"
+                "【开发期编译工具 · 非查询工具】调用 MetaEditor64 对指定 EA 的 .mq5 源码做语法编译，"
                 "返回编译器 stderr/stdout。仅在『修改策略代码后需要重新编译』这一场景下使用。"
+                "**强烈建议传 ea_name 参数指定要编译的 EA**——不传时回落到"
+                "『chart 上挂的 EA』的旧行为，对刚创建、还没挂图表的新 EA 会编译错文件。"
                 "禁止用于：查看行情/价格/点差/K线 → 请改用 get_market_info；"
                 "查看账户/持仓/订单/盘面状态 → 请改用 get_trading_status；"
                 "查看策略运行/信号 → 请改用 get_strategy_status。"
                 "此工具无任何查询能力，调用它不会得到市场数据。"
             ),
-            inputSchema={"type": "object", "properties": {}, "required": []}
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ea_name": {
+                        "type": "string",
+                        "description": "要编译的 EA 名（不带 .ex5 / .mq5 后缀，如 'GoldTrendMartinV1'）。会先在 workspace/strategies/ 找源码、复制到 MQL5/Experts/，再编译。"
+                    }
+                },
+                "required": []
+            }
         ),
         Tool(
             name="get_strategy_backups",
@@ -3148,7 +3430,549 @@ def get_all_tools() -> list[Tool]:
             description="诊断 EA 参数各来源的实际状态：runtime_json (EA 真实值)、config_set (MCP 覆盖)、源码默认值，以及仅供参考的 .chr 图表快照。当 get_strategy_params 读到的值和 MT5 图表上显示的不一致时，用此工具排查。",
             inputSchema={"type": "object", "properties": {}, "required": []}
         ),
+        Tool(
+            name="run_backtest",
+            description=(
+                "在 MT5 Strategy Tester 里跑一个 EA 的回测。非阻塞：立即返回 backtest_id，"
+                "实际回测可能耗时 1-30 分钟（取决于品种、周期、日期范围、历史数据是否本地）。"
+                "调用后用 get_backtest_status 轮询进度，结束时拿到指标。"
+                "前置条件：EA 必须已经编译（.ex5 在 MQL5/Experts/）；MT5 终端可以正在运行（会单独 spawn 一个测试实例）。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ea_name":   {"type": "string", "description": "EA 名（不带 .ex5），需在 MQL5/Experts/ 已编译"},
+                    "symbol":    {"type": "string", "description": "品种，如 XAUUSD / EURUSD"},
+                    "period":    {"type": "string", "enum": ["M1","M5","M15","M30","H1","H4","D1","W1"], "description": "周期"},
+                    "from_date": {"type": "string", "description": "起始日期 YYYY-MM-DD"},
+                    "to_date":   {"type": "string", "description": "结束日期 YYYY-MM-DD"},
+                    "deposit":   {"type": "number", "default": 10000, "description": "初始资金（默认 10000）"},
+                    "leverage":  {"type": "integer", "default": 100, "description": "杠杆（默认 100）"},
+                    "currency":  {"type": "string", "default": "USD", "description": "账户货币"},
+                    "input_overrides": {
+                        "type": "object",
+                        "description": "覆盖 EA 的 input 参数（可选）。键为 input 名，值为字符串/数字/bool。",
+                    },
+                },
+                "required": ["ea_name", "symbol", "period", "from_date", "to_date"],
+            },
+        ),
+        Tool(
+            name="get_backtest_status",
+            description=(
+                "查询 run_backtest 启动的回测进度。"
+                "running 时返回 elapsed_seconds；ok 时返回 metrics（净利、夏普、最大回撤、交易数等）；"
+                "error / finished_no_report 时返回错误说明。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "backtest_id": {"type": "string", "description": "run_backtest 返回的 id"},
+                },
+                "required": ["backtest_id"],
+            },
+        ),
+        Tool(
+            name="list_backtests",
+            description=(
+                "列出回测记录（最近优先），含状态、EA 名、品种、净利润 / 夏普 / 交易数 / 最大回撤。"
+                "默认返回最近 20 条；可传 limit (1-100) 控制数量；传 ea 过滤指定 EA。"
+                "记录从 backtests.json 持久化文件加载，跨 MCP 进程重启可见。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20,
+                              "description": "返回最多 N 条，默认 20"},
+                    "ea":    {"type": "string", "description": "（可选）只返回指定 EA 名的记录"},
+                },
+                "required": [],
+            },
+        ),
+    ] + _trading_write_tools() + [   # 内部按 _is_trading_write_enabled / _is_trading_write_open_enabled 各自决定
+        # 始终可见的诊断工具 — 用户在 chat 里说「调用 easydeal_debug_env」
+        # 就能看到当前 MCP 进程里 EASYDEAL_TRADING_WRITE / EASYDEAL_TRADING_WRITE_OPEN
+        # 等关键 env，用来定位「我开了开关但 Claude 还说没工具」之类的问题。
+        Tool(
+            name="easydeal_debug_env",
+            description=(
+                "诊断工具：返回当前 easydeal MCP 进程看到的关键环境变量 + 是否暴露 平仓/改单/开仓 工具。"
+                "用户反馈「开了平仓/开仓权限但 Claude 看不到工具」时调用此工具，"
+                "如果返回 trading_write_enabled / trading_write_open_enabled =false 说明 .mcp.json 没正确注入 env，"
+                "= true 但工具仍不可见说明问题在 Claude / MCP 端。"
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
     ]
+
+
+def _is_trading_write_enabled() -> bool:
+    """读环境变量决定是否暴露「平仓 / 改单」类工具（不含开仓）。
+    客户端「设置 → 高级 → 允许 AI 直接平仓 / 改单」勾上时会注入
+    EASYDEAL_TRADING_WRITE=1。默认关闭以防 LLM 在用户没明确授权时动实盘。
+    跟 _is_trading_write_open_enabled 拆开 —— 开仓权限独立 toggle。"""
+    return os.getenv("EASYDEAL_TRADING_WRITE", "").strip() in ("1", "true", "yes", "on")
+
+
+def _is_trading_write_open_enabled() -> bool:
+    """单独控 open_position 工具的暴露。开仓比平/改激进得多
+    （凭空建仓的风险敞口完全不可控），用户经常想给 AI 平改权限但不给开仓权限。
+    EASYDEAL_TRADING_WRITE_OPEN=1 才暴露 open_position。"""
+    return os.getenv("EASYDEAL_TRADING_WRITE_OPEN", "").strip() in ("1", "true", "yes", "on")
+
+
+def _debug_env_tool() -> list[TextContent]:
+    """easydeal_debug_env 实现 — 把当前进程的几个 EASYDEAL_* env 摊开给 Claude。"""
+    keys = [
+        "EASYDEAL_TRADING_WRITE", "EASYDEAL_TRADING_WRITE_OPEN",
+        "EASYDEAL_WORKSPACE_DIR",
+        "EASYDEAL_MT5_INSTALL_DIR", "EASYDEAL_MT5_DATA_DIR",
+        "EASYDEAL_BACKTESTS_FILE", "EASYDEAL_SCHEDULER_DB",
+        "EASYDEAL_BACKTEST_LOGIN", "EASYDEAL_BACKTEST_SERVER",
+        "EASYDEAL_BACKTEST_INSTALL_DIR", "EASYDEAL_BACKTEST_PORTABLE",
+    ]
+    env_view = {k: os.getenv(k, "") for k in keys}
+    # 把 LOGIN 这种敏感字段做个 mask
+    if env_view.get("EASYDEAL_BACKTEST_LOGIN"):
+        v = env_view["EASYDEAL_BACKTEST_LOGIN"]
+        env_view["EASYDEAL_BACKTEST_LOGIN"] = f"{v[:3]}***{v[-2:]}" if len(v) > 5 else "***"
+    return [TextContent(type="text", text=json.dumps({
+        "trading_write_enabled":      _is_trading_write_enabled(),
+        "trading_write_open_enabled": _is_trading_write_open_enabled(),
+        "env":                        env_view,
+        "tools_visible_count":        len([1 for _ in _trading_write_tools()]) + 1,  # +1 = self
+        "hint": (
+            "如果 trading_write_enabled / trading_write_open_enabled = false 但客户端开关已开 — "
+            "1) 检查 .mcp.json 里 mcpServers.easydeal.env 是否有 "
+            "    EASYDEAL_TRADING_WRITE=\"1\" / EASYDEAL_TRADING_WRITE_OPEN=\"1\" "
+            "2) 没有的话切到 设置 tab 把开关关一下再重新打开（强制 reapplyWorkspace）"
+            "3) 重新打开聊天（claude --print 每次会重读 .mcp.json）"
+        ),
+    }, ensure_ascii=False, indent=2))]
+
+
+def _trading_close_position(strategy, arguments: dict) -> list[TextContent]:
+    """实现 close_position 工具：平 EA 全部持仓，或单笔平掉某 ticket。"""
+    ticket = arguments.get("ticket")
+    if ticket is None:
+        try:
+            r = strategy.close_all_orders()
+        except Exception as exc:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False, "error": str(exc),
+            }, ensure_ascii=False))]
+        ok = "error" not in (r or {})
+        return [TextContent(type="text", text=json.dumps({
+            "ok": ok, "scope": "all_tracked", **(r or {}),
+        }, ensure_ascii=False, indent=2))]
+
+    try:
+        ticket = int(ticket)
+    except (TypeError, ValueError):
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"invalid ticket: {arguments.get('ticket')!r}",
+        }, ensure_ascii=False))]
+
+    positions = mt5.positions_get(ticket=ticket)
+    if not positions:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"position not found: {ticket}",
+        }, ensure_ascii=False))]
+    pos = positions[0]
+    sym = pos.symbol
+    info = mt5.symbol_info(sym)
+    if info is None:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"symbol_info failed for {sym}",
+        }, ensure_ascii=False))]
+
+    order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    price = info.bid if order_type == mt5.ORDER_TYPE_SELL else info.ask
+    req = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       sym,
+        "volume":       pos.volume,
+        "type":         order_type,
+        "position":     pos.ticket,
+        "price":        price,
+        "magic":        pos.magic,
+        "comment":      "Close (AI)",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(req)
+    ok = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+    return [TextContent(type="text", text=json.dumps({
+        "ok":      ok,
+        "ticket":  pos.ticket,
+        "symbol":  sym,
+        "volume":  pos.volume,
+        "retcode": getattr(result, "retcode", None),
+        "comment": getattr(result, "comment", None),
+        "message": None if ok else f"order_send retcode={getattr(result, 'retcode', '?')}",
+    }, ensure_ascii=False, indent=2))]
+
+
+# MT5 retcode 常见值 → 中文友好提示。用户实测反馈：「连续调用 modify_position
+# 只有第一张改成功，下一轮对话依然如此」。根因诊断：order_send 失败时只返 retcode
+# 数字（如 10016），AI 看不懂含义所以下次重试用同款不合规参数 → 仍失败。加详细诊断 +
+# stops_level 校验后 AI 收到「SL 距离当前价仅 30 points，broker 要求 ≥ 100 points」
+# 就知道该把 SL 拉远。
+_MT5_RETCODE_TO_CN = {
+    10004: "REQUOTE — 报价已变，需要拉新价重试",
+    10006: "REJECT — broker 直接拒单",
+    10007: "CANCEL — 客户端取消",
+    10008: "PLACED — 挂单已就位",
+    10009: "DONE — 成功",
+    10010: "DONE_PARTIAL — 部分成交",
+    10011: "ERROR — 通用错误",
+    10012: "TIMEOUT — broker 端超时",
+    10013: "INVALID — 请求无效",
+    10014: "INVALID_VOLUME — 手数不合法（< min / > max / 非 step 倍数）",
+    10015: "INVALID_PRICE — 价格不合法",
+    10016: "INVALID_STOPS — SL/TP 离当前价距离不够（< trade_stops_level）",
+    10017: "TRADE_DISABLED — 该 symbol 当前不允许交易",
+    10018: "MARKET_CLOSED — 市场休市",
+    10019: "NO_MONEY — 保证金不足",
+    10020: "PRICE_CHANGED — 价格已变",
+    10021: "PRICE_OFF — 无可用价（datafeed 死）",
+    10022: "INVALID_EXPIRATION — 过期时间不合法",
+    10023: "ORDER_CHANGED — 订单状态已变",
+    10024: "TOO_MANY_REQUESTS — broker 限流",
+    10025: "NO_CHANGES — 改单参数跟现有值相同（不算错）",
+    10026: "SERVER_DISABLES_AT — broker 服务端关了 AT",
+    10027: "CLIENT_DISABLES_AT — MT5 客户端「自动交易」按钮没开 (顶部红色 → 点成绿色)",
+    10028: "LOCKED — 该订单被锁",
+    10029: "FROZEN — 订单冻结（pending）",
+    10030: "INVALID_FILL — filling 类型 broker 不支持（IOC/FOK/RETURN）",
+    10031: "CONNECTION — SDK 跟 broker 断了",
+    10032: "ONLY_REAL — 该 symbol 仅实盘可交易",
+    10033: "LIMIT_ORDERS — 挂单数量到上限",
+    10034: "LIMIT_VOLUME — 持仓量到上限",
+    10038: "CLOSE_ORDER_EXIST — close-by 已存在",
+    10039: "LIMIT_POSITIONS — 持仓数到上限",
+    10044: "INVALID_ORDER — 订单不存在",
+    10045: "POSITION_CLOSED — 仓位已平",
+}
+
+
+def _retcode_explain(retcode):
+    """retcode → 中文解释 + mt5.last_error() 详细信息组合。"""
+    cn = _MT5_RETCODE_TO_CN.get(retcode, "未知 retcode")
+    try:
+        le = mt5.last_error()
+        return f"{retcode} {cn} | last_error={le}"
+    except Exception:
+        return f"{retcode} {cn}"
+
+
+def _trading_modify_position(strategy, arguments: dict) -> list[TextContent]:
+    """实现 modify_position 工具：修改一单的 SL / TP。"""
+    raw_ticket = arguments.get("ticket")
+    try:
+        ticket = int(raw_ticket)
+    except (TypeError, ValueError):
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"invalid ticket: {raw_ticket!r}",
+        }, ensure_ascii=False))]
+
+    sl = arguments.get("sl")
+    tp = arguments.get("tp")
+    if sl is None and tp is None:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": "must specify sl or tp",
+        }, ensure_ascii=False))]
+
+    # 每次入口先 ping SDK 连接，挂了立刻 re-init 一次
+    try:
+        ti = mt5.terminal_info()
+        if not (ti and getattr(ti, "connected", False)):
+            mt5.initialize()
+    except Exception:
+        pass
+
+    positions = mt5.positions_get(ticket=ticket)
+    if not positions:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"position not found: {ticket}",
+            "hint": "ticket 可能刚被 broker 平仓了 (SL/TP 触发) 或 ticket 写错",
+        }, ensure_ascii=False))]
+    pos = positions[0]
+
+    new_sl = float(sl) if sl is not None else float(pos.sl)
+    new_tp = float(tp) if tp is not None else float(pos.tp)
+
+    # stops_level 距离 + 价方向 预检验。AI 算出来的 SL/TP 经常离当前价太近，
+    # broker 直接返 10016 INVALID_STOPS。在这里检出来，给 AI 明确数字提示。
+    pre_warnings = []
+    try:
+        info = mt5.symbol_info(pos.symbol)
+        if info is not None:
+            stops_lvl = int(getattr(info, "trade_stops_level", 0) or 0)
+            point = float(getattr(info, "point", 0) or 0)
+            tick = mt5.symbol_info_tick(pos.symbol)
+            if tick and stops_lvl > 0 and point > 0:
+                min_dist = stops_lvl * point
+                bid = float(tick.bid); ask = float(tick.ask)
+                # BUY (pos.type==0): SL < bid, TP > bid; SL/bid 距离 >= min_dist
+                # SELL (pos.type==1): SL > ask, TP < ask; SL/ask 距离 >= min_dist
+                if pos.type == 0:  # BUY
+                    if new_sl > 0 and (bid - new_sl) < min_dist:
+                        pre_warnings.append(
+                            f"BUY 的 SL={new_sl} 离当前 bid={bid} 仅 {(bid-new_sl)/point:.0f} points，"
+                            f"broker 要求 ≥ {stops_lvl} points（min_dist={min_dist}）"
+                        )
+                    if new_tp > 0 and (new_tp - bid) < min_dist:
+                        pre_warnings.append(
+                            f"BUY 的 TP={new_tp} 离当前 bid={bid} 仅 {(new_tp-bid)/point:.0f} points，"
+                            f"broker 要求 ≥ {stops_lvl} points"
+                        )
+                elif pos.type == 1:  # SELL
+                    if new_sl > 0 and (new_sl - ask) < min_dist:
+                        pre_warnings.append(
+                            f"SELL 的 SL={new_sl} 离当前 ask={ask} 仅 {(new_sl-ask)/point:.0f} points，"
+                            f"broker 要求 ≥ {stops_lvl} points"
+                        )
+                    if new_tp > 0 and (ask - new_tp) < min_dist:
+                        pre_warnings.append(
+                            f"SELL 的 TP={new_tp} 离当前 ask={ask} 仅 {(ask-new_tp)/point:.0f} points，"
+                            f"broker 要求 ≥ {stops_lvl} points"
+                        )
+    except Exception:
+        pass  # 验证只是预警，不阻断 order_send（万一 broker 实际允许）
+
+    req = {
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "symbol":   pos.symbol,
+        "position": pos.ticket,
+        "sl":       new_sl,
+        "tp":       new_tp,
+    }
+    result = mt5.order_send(req)
+    ok = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+    retcode = getattr(result, "retcode", None)
+
+    # 失败时给 AI 明确诊断，AI 下次重试就能调整参数
+    explained = _retcode_explain(retcode) if not ok else None
+
+    out = {
+        "ok":          ok,
+        "ticket":      pos.ticket,
+        "symbol":      pos.symbol,
+        "side":        "buy" if pos.type == 0 else "sell",
+        "old_sl":      pos.sl,
+        "old_tp":      pos.tp,
+        "new_sl":      new_sl,
+        "new_tp":      new_tp,
+        "retcode":     retcode,
+        "retcode_explain": explained,
+        "comment":     getattr(result, "comment", None),
+        "request_id":  getattr(result, "request_id", None),
+        "message":     None if ok else f"order_send 失败 — {explained}",
+    }
+    if pre_warnings:
+        out["pre_validation_warnings"] = pre_warnings
+        if not ok:
+            out["hint"] = "预检验已提示 SL/TP 距离问题，请重算 SL/TP 离当前价 ≥ broker 要求的 points 数"
+    return [TextContent(type="text", text=json.dumps(out, ensure_ascii=False, indent=2))]
+
+
+def _trading_open_position(strategy, arguments: dict) -> list[TextContent]:
+    """实现 open_position 工具：市价开一单（buy 或 sell）。
+    用户必须在「设置 → 高级」显式开启「允许 AI 直接开仓」(EASYDEAL_TRADING_WRITE_OPEN=1)
+    才会暴露该工具 —— 跟平/改是两个独立开关。"""
+    symbol = (arguments.get("symbol") or "").strip()
+    side = (arguments.get("side") or "").strip().lower()
+    raw_vol = arguments.get("volume")
+
+    if not symbol:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": "symbol 必填",
+        }, ensure_ascii=False))]
+    if side not in ("buy", "sell"):
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"side 必须是 'buy' 或 'sell'，收到 {side!r}",
+        }, ensure_ascii=False))]
+    try:
+        volume = float(raw_vol)
+    except (TypeError, ValueError):
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"invalid volume: {raw_vol!r}",
+        }, ensure_ascii=False))]
+    if volume <= 0:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"volume 必须 > 0，收到 {volume}",
+        }, ensure_ascii=False))]
+
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return [TextContent(type="text", text=json.dumps({
+            "ok":    False,
+            "error": f"symbol_info 失败：{symbol} 在当前 broker 不存在",
+            "hint":  "去 MT5 Market Watch 看实际可用 symbol 名（可能带后缀 m / # / .c）",
+        }, ensure_ascii=False))]
+    # 没在 Market Watch 里加过 → symbol_info_tick 可能返回不了。先 select 一下。
+    if not getattr(info, "visible", False):
+        try: mt5.symbol_select(symbol, True)
+        except Exception: pass
+
+    # 量化到 broker 允许的 volume step / min / max，避免「Invalid volume」retcode。
+    vmin = getattr(info, "volume_min", None) or 0.01
+    vmax = getattr(info, "volume_max", None) or 100.0
+    vstep = getattr(info, "volume_step", None) or 0.01
+    if volume < vmin:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"volume {volume} < broker min {vmin}",
+        }, ensure_ascii=False))]
+    if volume > vmax:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"volume {volume} > broker max {vmax}",
+        }, ensure_ascii=False))]
+    # round 到 step 的整数倍
+    try:
+        steps = round(volume / vstep)
+        volume = round(steps * vstep, 8)
+    except Exception:
+        pass
+
+    order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
+    price = info.ask if order_type == mt5.ORDER_TYPE_BUY else info.bid
+    if not price:
+        # 兜底 tick — symbol_info 偶尔 bid/ask 为 0（行情未到），再抓一次 tick
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        except Exception:
+            price = 0
+    if not price:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False, "error": f"无法获取 {symbol} 当前报价（bid/ask=0），市场未开盘 / 行情中断？",
+        }, ensure_ascii=False))]
+
+    raw_sl = arguments.get("sl")
+    raw_tp = arguments.get("tp")
+    sl = float(raw_sl) if raw_sl not in (None, "", 0) else 0.0
+    tp = float(raw_tp) if raw_tp not in (None, "", 0) else 0.0
+
+    raw_magic = arguments.get("magic")
+    try:
+        magic = int(raw_magic) if raw_magic is not None else 0
+    except (TypeError, ValueError):
+        magic = 0
+    # AI 没传 magic 时自动生成一个稳定 magic，让后续 deal 能归属回来。
+    # 用 time.time()*1000 取 31bit 范围内（MT5 magic 是 ulong 但 signed 32bit 安全）。
+    if magic == 0:
+        magic = int(time.time() * 1000) & 0x7FFFFFFF
+
+    comment = arguments.get("comment") or "Open (AI)"
+    try:
+        deviation = int(arguments.get("deviation") or 20)
+    except (TypeError, ValueError):
+        deviation = 20
+
+    req = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       symbol,
+        "volume":       volume,
+        "type":         order_type,
+        "price":        price,
+        "sl":           sl,
+        "tp":           tp,
+        "deviation":    deviation,
+        "magic":        magic,
+        "comment":      str(comment)[:31],   # MT5 comment 上限 31 字符
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(req)
+    ok = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+    retcode = getattr(result, "retcode", None)
+    explained = _retcode_explain(retcode) if not ok else None
+
+    return [TextContent(type="text", text=json.dumps({
+        "ok":              ok,
+        "symbol":          symbol,
+        "side":            side,
+        "volume":          volume,
+        "price":           price,
+        "sl":              sl,
+        "tp":              tp,
+        "magic":           magic,
+        "ticket":          getattr(result, "order", None) if ok else None,
+        "deal":            getattr(result, "deal", None),
+        "retcode":         retcode,
+        "retcode_explain": explained,
+        "comment":         getattr(result, "comment", None),
+        "message":         None if ok else f"order_send 失败 — {explained}",
+    }, ensure_ascii=False, indent=2))]
+
+
+def _trading_write_tools() -> list[Tool]:
+    """拆成两个独立权限 ——
+       - EASYDEAL_TRADING_WRITE=1     → close_position + modify_position
+       - EASYDEAL_TRADING_WRITE_OPEN=1 → open_position（独立 toggle）
+    两个开关互相独立，可以只开平/改不开开仓（最常见的「让 AI 帮我止损但不让它乱开新仓」）。"""
+    tools: list[Tool] = []
+    if _is_trading_write_enabled():
+        tools.append(Tool(
+            name="close_position",
+            description=(
+                "⚠ 实盘动作：平仓。可以平掉所有 EA 持仓（不传 ticket）或某一单（传 ticket）。"
+                "需要用户在客户端「设置 → 高级」里显式开启「允许 AI 直接平仓 / 改单」才会暴露此工具，"
+                "否则连工具列表里都没有。"
+                "成功返回平掉的 ticket 列表 + retcode；失败返回 error。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket": {
+                        "type": "integer",
+                        "description": "要平的具体单号（来自 get_trading_status 的 orders）；不传 = 平掉该 EA 的全部持仓",
+                    },
+                },
+                "required": [],
+            },
+        ))
+        tools.append(Tool(
+            name="modify_position",
+            description=(
+                "⚠ 实盘动作：修改一单的止盈 / 止损。同样需要在「设置 → 高级」里开启权限。"
+                "至少要传 sl 或 tp 之一。传 0 表示清除该止损 / 止盈。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket": {"type": "integer", "description": "持仓单号"},
+                    "sl": {"type": "number", "description": "新止损价；0 = 清除止损"},
+                    "tp": {"type": "number", "description": "新止盈价；0 = 清除止盈"},
+                },
+                "required": ["ticket"],
+            },
+        ))
+    if _is_trading_write_open_enabled():
+        tools.append(Tool(
+            name="open_position",
+            description=(
+                "⚠⚠ 实盘动作：市价开仓（凭空建仓，最高风险）。**独立**的授权开关 ——"
+                "用户必须在「设置 → 高级」里勾上「允许 AI 直接开仓」（跟平/改是两个开关）才会暴露。"
+                "返回新单 ticket + 实际成交价；失败时 error 字段说明原因（symbol 不可用 / "
+                "volume 越界 / 行情未开 / broker 拒单等）。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol":    {"type": "string",  "description": "品种代码，跟当前 broker 一致（XAUUSD / XAUUSDm / ...）"},
+                    "side":      {"type": "string",  "enum": ["buy", "sell"], "description": "方向"},
+                    "volume":    {"type": "number",  "description": "手数；会自动 round 到 broker 允许的 volume_step 倍数"},
+                    "sl":        {"type": "number",  "description": "止损价（绝对价位）；不传 / 传 0 = 不设止损"},
+                    "tp":        {"type": "number",  "description": "止盈价（绝对价位）；不传 / 传 0 = 不设止盈"},
+                    "magic":     {"type": "integer", "description": "magic number；不传 = 0（AI 自动生成稳定 magic）"},
+                    "comment":   {"type": "string",  "description": "订单备注（MT5 限制 31 字符）；不传 = 'Open (AI)'"},
+                    "deviation": {"type": "integer", "description": "允许滑点（点）；不传 = 20"},
+                },
+                "required": ["symbol", "side", "volume"],
+            },
+        ))
+    return tools
 
 
 @server.call_tool()
@@ -3157,9 +3981,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
         strategy = get_strategy()
         arguments = arguments or {}
+        # easydeal-settings MCP 改了 settings.json 的话，这里 cheap stat 一下；
+        # 检测到变更就重新绑 MT5 + 同步监控配置。一次工具调用一次 stat 不会
+        # 卡顿，重活只在 mtime 变了时才跑。
+        _maybe_reload_settings()
 
         if name == "get_monitor_logs":
-            date_prefix = arguments.get("date") or datetime.now().strftime("%Y-%m-%d")
+            date_prefix = arguments.get("date") or _bj_date_str()
             log_type = str(arguments.get("type", "ALL")).upper()
             limit = int(arguments.get("limit", 100))
 
@@ -3177,7 +4005,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
             # TimedRotatingFileHandler 把昨天及更早的内容轮转到
             # easydeal.log.<YYYY-MM-DD>，active 文件 easydeal.log 只含当天。
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = _bj_date_str()
             target_file = log_file
             if date_prefix != today:
                 rotated = f"{log_file}.{date_prefix}"
@@ -3200,7 +4028,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         if name == "get_mt5_logs":
-            date_str = arguments.get("date") or datetime.now().strftime("%Y-%m-%d")
+            date_str = arguments.get("date") or _bj_date_str()
             keyword = arguments.get("keyword")
             page = int(arguments.get("page", 1))
             page_size = int(arguments.get("page_size", 50))
@@ -3213,7 +4041,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         if name == "get_ea_logs":
-            date_str = arguments.get("date") or datetime.now().strftime("%Y-%m-%d")
+            date_str = arguments.get("date") or _bj_date_str()
             keyword = arguments.get("keyword")
             page = int(arguments.get("page", 1))
             page_size = int(arguments.get("page_size", 50))
@@ -3238,7 +4066,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "bid": symbol_info.bid,
                 "ask": symbol_info.ask,
                 "spread": symbol_info.spread,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "time": _now_bj_str()
             }
             return [TextContent(type="text", text=json.dumps(market_info, ensure_ascii=False, indent=2))]
 
@@ -3504,7 +4332,45 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         if name == "compile_strategy":
-            filepath = _get_strategy_file_path()
+            # Optional ea_name: if supplied, find that specific .mq5 source
+            # (workspace/strategies/<name>.mq5 → MQL5/Experts/<name>.mq5)
+            # and copy it into MT5/Experts/ before compile, so the resulting
+            # .ex5 is in the canonical location MT5 / our backtester expect.
+            requested_ea = (arguments.get("ea_name") or "").strip()
+            filepath = None
+            workspace_dir = os.getenv("EASYDEAL_WORKSPACE_DIR")
+            data_path_for_ea = _get_mt5_data_path()
+            if requested_ea:
+                ea_basename = requested_ea
+                if not ea_basename.lower().endswith(".mq5"):
+                    ea_basename += ".mq5"
+                # Look for the source .mq5
+                src_candidates = []
+                if workspace_dir:
+                    src_candidates.append(os.path.join(workspace_dir, "strategies", ea_basename))
+                if data_path_for_ea:
+                    src_candidates.append(os.path.join(data_path_for_ea, "MQL5", "Experts", ea_basename))
+                src_mq5 = next((p for p in src_candidates if os.path.isfile(p)), None)
+                if not src_mq5:
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": f"未找到 {ea_basename}",
+                         "looked_in": src_candidates}, ensure_ascii=False))]
+                # Ensure the file is at the canonical MT5/Experts location
+                if data_path_for_ea:
+                    target_dir = os.path.join(data_path_for_ea, "MQL5", "Experts")
+                    os.makedirs(target_dir, exist_ok=True)
+                    target_mq5 = os.path.join(target_dir, ea_basename)
+                    if os.path.abspath(src_mq5) != os.path.abspath(target_mq5):
+                        import shutil as _sh
+                        _sh.copy2(src_mq5, target_mq5)
+                    filepath = target_mq5
+                else:
+                    filepath = src_mq5
+            else:
+                # Backward-compat: no name given → fall back to "the EA on chart"
+                # discovery. Useful for users who only ever run one EA.
+                filepath = _get_strategy_file_path()
+
             metaeditor = _get_metaeditor_path()
 
             if not metaeditor or not os.path.isfile(metaeditor):
@@ -3570,6 +4436,43 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             # Capture .ex5 mtime before compile to detect whether MetaEditor actually rebuilt.
             ex5_path = os.path.splitext(filepath)[0] + ".ex5"
             ex5_mtime_before = os.path.getmtime(ex5_path) if os.path.isfile(ex5_path) else None
+
+            # Hash-based skip: if .ex5 already exists AND was compiled from
+            # this exact source content (sidecar `<ex5>.compiled_from` carries
+            # the recorded src sha256), skip recompile entirely.
+            #
+            # WHY this matters — the MT5 client tracks 「运行时长」 from the
+            # `loaded successfully` log timestamp, and flags 「需重新挂载」
+            # whenever the deployed .ex5's mtime is newer than that. A
+            # gratuitous recompile (same source content) touches mtime,
+            # tripping that warning and effectively resetting the user's
+            # perception of EA uptime even though the running binary didn't
+            # change. Skipping unchanged sources keeps the running EA's
+            # mount status clean.
+            import hashlib as _hash
+            try:
+                with open(filepath, "rb") as _src_f:
+                    _src_sha = _hash.sha256(_src_f.read()).hexdigest()
+            except Exception:
+                _src_sha = None
+
+            _sidecar = ex5_path + ".compiled_from"
+            if (_src_sha and os.path.isfile(ex5_path) and os.path.isfile(_sidecar)):
+                try:
+                    with open(_sidecar, "r", encoding="utf-8") as _sf:
+                        _stored_sha = _sf.read().strip()
+                except Exception:
+                    _stored_sha = ""
+                if _stored_sha == _src_sha:
+                    return [TextContent(type="text", text=json.dumps({
+                        "ok": True,
+                        "skipped_recompile": True,
+                        "reason": ("源码 sha256 未变 — 保持现有 .ex5 不动，避免触发"
+                                   "客户端 mount 检测的『需重新挂载』警告。"),
+                        "ex5_path": ex5_path,
+                        "ex5_mtime": ex5_mtime_before,
+                        "src_sha256": _src_sha,
+                    }, ensure_ascii=False))]
 
             try:
                 proc = subprocess.run(
@@ -3664,6 +4567,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             reload_trigger = None
             if ex5_rebuilt:
                 reload_trigger = _touch_reload_trigger()
+                # Persist the source sha256 so a future identical compile can be
+                # short-circuited (skip-recompile branch above). Best-effort.
+                if _src_sha:
+                    try:
+                        with open(_sidecar, "w", encoding="utf-8") as _sf:
+                            _sf.write(_src_sha)
+                    except Exception:
+                        pass
 
             result = {
                 "success": success,
@@ -3805,10 +4716,53 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             }
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
+        if name == "run_backtest":
+            return _run_backtest_tool(arguments)
+
+        if name == "get_backtest_status":
+            return _get_backtest_status_tool(arguments)
+
+        if name == "list_backtests":
+            return _list_backtests_tool(arguments)
+
+        if name == "easydeal_debug_env":
+            return _debug_env_tool()
+
+        # ---- Trading-write tools (gated) ----
+        # close/modify 跟 open 拆成两个独立 gate ——
+        # EASYDEAL_TRADING_WRITE 只控 close + modify；
+        # EASYDEAL_TRADING_WRITE_OPEN 单独控 open_position（凭空建仓的风险敞口完全不可控）。
+        if name in ("close_position", "modify_position"):
+            if not _is_trading_write_enabled():
+                return [TextContent(type="text", text=json.dumps({
+                    "error": "trading_write_disabled",
+                    "message": (
+                        "用户没在客户端「设置 → 高级」里开启「允许 AI 直接平仓 / 改单」。"
+                        "请先告知用户去开启此权限再重试。"
+                    ),
+                }, ensure_ascii=False))]
+            if name == "close_position":
+                return _trading_close_position(strategy, arguments)
+            if name == "modify_position":
+                return _trading_modify_position(strategy, arguments)
+        if name == "open_position":
+            if not _is_trading_write_open_enabled():
+                return [TextContent(type="text", text=json.dumps({
+                    "error": "trading_write_open_disabled",
+                    "message": (
+                        "用户没在客户端「设置 → 高级」里开启「允许 AI 直接开仓」（这跟平/改是两个独立开关）。"
+                        "请先告知用户去开启此权限再重试 —— 开仓的风险敞口比平仓大得多，需要单独确认。"
+                    ),
+                }, ensure_ascii=False))]
+            return _trading_open_position(strategy, arguments)
+
         return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False))]
 
     except Exception as exc:
-        logging.error(f"Tool error {name}: {exc}")
+        # logging.exception 会自动捎带完整 traceback；之前用的 logging.error
+        # 只 stringify exc，结果 logs/easydeal.log 里只见错误消息看不到哪行炸
+        # —— 用户上传诊断 mcp_log.recent_errors 抠到错误也没法定位。
+        logging.exception(f"Tool error {name}: {exc}")
         return [TextContent(type="text", text=json.dumps({"error": str(exc)}, ensure_ascii=False))]
 
 
@@ -3897,7 +4851,7 @@ async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptRe
         data_path = _get_mt5_data_path()
         if data_path:
             ea_log_dir = os.path.join(data_path, "MQL5", "Logs")
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = _bj_date_str()
             ea_result = _read_mt5_log(ea_log_dir, today, page_size=20, page=1)
             if "lines" in ea_result and ea_result["lines"]:
                 ea_logs_text = "\nRecent EA logs:\n" + "\n".join(ea_result["lines"])
@@ -3991,6 +4945,2015 @@ async def list_tools() -> list[Tool]:
         else:
             logging.error("Service startup failed")
     return get_all_tools()
+
+
+# ============== Backtest ==============
+#
+# Drives the MT5 Strategy Tester from the command line. Non-blocking by
+# design — `run_backtest` returns immediately with a backtest_id, and the
+# caller polls `get_backtest_status` to wait for results.
+#
+# We spawn a fresh `terminal64.exe /config:<ini>` instance per test. The
+# config INI has a `[Tester]` section that drives the test, plus optional
+# `[TesterInputs]` to override input parameters. When `ShutdownTerminal=1`
+# the test instance exits on its own once the run finishes.
+#
+# Reports come out at <data_path>/Reports/<name>.htm (UTF-16 LE). We parse
+# the standard MetaQuotes report HTML to extract the headline metrics.
+#
+# Concurrency caveat: running a test instance while the user has MT5 open
+# elsewhere usually works (MT5 allows multiple instances), but for clean
+# isolation users may want to close their live terminal first.
+
+import subprocess
+
+_backtests: dict[str, dict] = {}  # bt_id -> state dict (in-memory; includes live proc handle)
+_BT_KEEP = 30  # cap memory: keep last N records
+_backtests_loaded_from_disk = False  # one-shot init guard
+
+# Concurrent-spawn cap. MT5 instances on the same data dir contend for the
+# data-dir lock; running 2+ in parallel often produces "finished_no_report"
+# for one of them. Serialise via an internal queue.
+_MAX_CONCURRENT_BACKTESTS = 1
+
+
+def _running_backtests_count() -> int:
+    return sum(1 for bt in _backtests.values() if bt.get("status") == "running")
+
+
+def _spawn_backtest_now(bt_id: str, bt: dict) -> bool:
+    """Actually start the terminal64 subprocess for a backtest record. The
+    record must already have spawn_cmd / spawn_cwd / spawn_creationflags
+    populated. Returns True on success, False on failure (and writes
+    error fields onto the record)."""
+    try:
+        kwargs = {"cwd": bt.get("spawn_cwd")}
+        flags = bt.get("spawn_creationflags") or 0
+        if flags:
+            kwargs["creationflags"] = flags
+        # spawn_cmd is now a pre-quoted string (so /config:"path with space"
+        # is honored by MT5). Old records may still have it as a list — handle
+        # both for back-compat with persisted state.
+        spawn_cmd = bt["spawn_cmd"]
+        if isinstance(spawn_cmd, list):
+            proc = subprocess.Popen(spawn_cmd, **kwargs)
+        else:
+            proc = subprocess.Popen(spawn_cmd, shell=False, **kwargs)
+        bt["proc"] = proc
+        bt["pid"] = proc.pid           # 持久化到 backtests.json — 客户端「取消」按钮能直接 kill
+        bt["status"] = "running"
+        bt["started_at"] = time.time()  # reset elapsed timer when actually starting
+        bt.pop("queued_at", None)
+        return True
+    except Exception as exc:
+        bt["status"] = "error"
+        bt["error"] = f"spawn failed: {exc}"
+        bt["finished_at"] = time.time()
+        return False
+
+
+def _scheduler_db_path() -> str | None:
+    """Locate scheduler.db. Prefer EASYDEAL_SCHEDULER_DB env (set by the
+    easydeal-client when wiring up .mcp.json); else derive as a sibling of
+    backtests.json (both live in <userData>/data/)."""
+    p = os.getenv("EASYDEAL_SCHEDULER_DB")
+    if p and os.path.isfile(p):
+        return p
+    bt = _backtests_file()
+    if bt:
+        guess = os.path.join(os.path.dirname(bt), "scheduler.db")
+        if os.path.isfile(guess):
+            return guess
+    return None
+
+
+def _auto_schedule_backtest_poll(bt_id: str, ea: str, symbol: str) -> tuple[bool, str | None]:
+    """Insert a polling task DIRECTLY into scheduler.db so the easydeal-client
+    sidecar will fire it every minute and call get_backtest_status until the
+    backtest finishes.
+
+    Why direct DB insert (vs Claude calling mcp__easydeal-scheduler__schedule_task):
+    LLMs are notorious for *claiming* "I scheduled it" without actually calling
+    the tool — observed in practice with 3 backtest runs in this session, all
+    chat replies said "已设置自动检查任务" but scheduler.db had 0 entries.
+    Removing Claude from the loop makes the auto-poll behaviour reliable.
+
+    Returns (ok, task_id_or_error).
+    """
+    db_path = _scheduler_db_path()
+    if not db_path:
+        return False, "scheduler.db not found"
+    try:
+        import sqlite3 as _sql
+        import secrets as _sec
+        task_id = "t_" + _sec.token_hex(6)
+        now_ms = int(time.time() * 1000)
+        # Fire at the next minute boundary so it polls within ~60s.
+        next_fire = ((now_ms // 60_000) + 1) * 60_000
+        prompt = (
+            f"自动触发：查询回测 {bt_id} 进度。\n"
+            f"调 mcp__easydeal__get_backtest_status({{\"backtest_id\":\"{bt_id}\"}})。\n"
+            f"\n"
+            f"⚠ 铁律：**绝对不要主动调 mcp__easydeal__run_backtest 重试这只回测**。\n"
+            f"任何状态（包括 config_error / error / finished_no_report / 0 笔成交）都只汇报给用户 + cancel_task 自己 → 由用户决定要不要重跑。原因：\n"
+            f"  - 失败常因配置（accounts.dat 缺失 / 副本 MT5 数据没下载 / 起止日期超出 broker 数据范围 / .ex5 跟 .mq5 版本不一致）\n"
+            f"  - 不修配置直接重试 = 必然再失败，每次都烧 token + 弹通知\n"
+            f"  - 用户看到失败原因，10 秒内自己判断要不要修 + 重发 比让 LLM 瞎试 10 次靠谱\n"
+            f"\n"
+            f"分支处理：\n"
+            f"- status=queued/running → 简短日志，不要发到用户对话；不要再排新任务。\n"
+            f"- status=ok（回测托管模式 — 给用户综合分析，不是只甩数字）：\n"
+            f"  1. Read strategies/{ea}.md（如果文件存在）— 拿到策略意图、风险阈值、参数预期。没文件就跳过这步。\n"
+            f"  2. 把 metrics 跟 .md 描述的合理表现对照，判断 verdict：\n"
+            f"     - 净利 / 夏普 是否达策略 doc 描述的合理预期\n"
+            f"     - 最大回撤 是否超出 .md 里写的风控阈值\n"
+            f"     - 交易频率 / 胜率 / 盈亏比 是否符合策略性质（高频抓小利 vs 低频大趋势 vs 网格 vs 马丁）\n"
+            f"  3. 给一段话评估，最后一句明确给 verdict 之一：\n"
+            f"     - ✅ 通过 — 表现达预期，可以推下一步（实盘 demo / 实盘小仓试跑）\n"
+            f"     - ⚠ 调参 — 哪个 input 怎么调（具体数值范围，不要泛泛「调整参数」）\n"
+            f"     - ❌ 否决 — 这套思路可能不适合这个品种/周期/时段，建议换个方向\n"
+            f"  4. 用这个格式发到 chat + wechat：\n"
+            f"     ```\n"
+            f"     ✅ 回测完成 {ea} @ {symbol}\n"
+            f"     净利 +XXX (XX%)  夏普 X.XX  最大回撤 -X.X%\n"
+            f"     交易 XX 笔  胜率 XX%  盈亏比 X.X\n"
+            f"     \n"
+            f"     【评估】<两三句话，结合 .md 意图分析为什么这个数字 OK / 不 OK>\n"
+            f"     【下一步】<{{✅ 通过 / ⚠ 调参 / ❌ 否决}}>: <具体建议>\n"
+            f"     ```\n"
+            f"  5. **必须**调 mcp__easydeal-scheduler__cancel_task({{\"task_id\":\"<触发上下文 Task id>\"}}) 把自己关掉。\n"
+            f"- status=error/finished_no_report/config_error → **不要泛泛说「失败了」**。返回里有 `data.message`（已含具体 hint）+ `data.diagnostic.log_lines`（MT5 日志原文）+ `data.next_steps`（用户该怎么做）—— 直接把这三块结构化转告用户，格式：\n"
+            f"     ```\n"
+            f"     ⚠ 回测失败 {ea} @ {symbol}\n"
+            f"     原因：<data.message 这句话>\n"
+            f"     \n"
+            f"     MT5 日志关键行：\n"
+            f"     - <log_lines[0]>\n"
+            f"     - <log_lines[1]>\n"
+            f"     ...（最多 4 行；没 log_lines 就省略这块）\n"
+            f"     \n"
+            f"     建议：\n"
+            f"     1. <next_steps[0]>\n"
+            f"     2. <next_steps[1]>\n"
+            f"     ...\n"
+            f"     ```\n"
+            f"     讲完**必须**调 cancel_task 关掉自己。**不要重试** —— 上面铁律已说明。\n"
+            f"- 返回里有 user_action_hint → 转告用户。\n"
+        )
+        # Declare delivery channels via the new `notify` column. Value is
+        # JSON-encoded list — see scheduler_mcp.py _normalize_notify().
+        # We push to chat AND wechat (the recipient-window guards on the
+        # Electron side handle "is wechat actually wanted right now").
+        notify_json = '["chat","wechat"]'
+        with _sql.connect(db_path) as conn:
+            # Add the column on the fly if it doesn't exist (covers DBs
+            # created before the schema change).
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            if "notify" not in cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN notify TEXT")
+            conn.execute(
+                """INSERT INTO tasks
+                   (id, name, schedule, kind, prompt, mode, enabled, created_at,
+                    next_fire_at, last_fire_at, last_status, notify)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)""",
+                (task_id, f"回测进度 {ea} {bt_id}", "* * * * *", "cron",
+                 prompt, "llm_headless", 1, now_ms, next_fire, notify_json),
+            )
+        return True, task_id
+    except Exception as exc:
+        logging.exception("[backtest] auto-schedule poll failed")
+        return False, str(exc)
+
+
+def _schedule_pending_backtests():
+    """Promote oldest queued backtests to running while we have capacity."""
+    while _running_backtests_count() < _MAX_CONCURRENT_BACKTESTS:
+        queue = sorted(
+            [(bt_id, bt) for bt_id, bt in _backtests.items() if bt.get("status") == "queued"],
+            key=lambda kv: kv[1].get("queued_at") or 0,
+        )
+        if not queue:
+            return
+        bt_id, bt = queue[0]
+        if _spawn_backtest_now(bt_id, bt):
+            logging.info("[backtest] dequeued %s → running", bt_id)
+        _save_persisted_backtests()
+
+
+def _queue_position(bt_id: str) -> int:
+    """1-based position among queued tasks; 0 means not queued."""
+    queue = sorted(
+        [(b_id, bt) for b_id, bt in _backtests.items() if bt.get("status") == "queued"],
+        key=lambda kv: kv[1].get("queued_at") or 0,
+    )
+    for i, (b_id, _) in enumerate(queue, start=1):
+        if b_id == bt_id:
+            return i
+    return 0
+
+
+# ---- Persistent backtests file ----
+# When EASYDEAL_BACKTESTS_FILE is set (the easydeal-client passes it),
+# every state change is mirrored to that JSON. The Electron UI reads the
+# file to render per-EA history and unread badges.
+
+def _backtests_file() -> str | None:
+    p = os.getenv("EASYDEAL_BACKTESTS_FILE")
+    if p:
+        return p
+    workspace = os.getenv("EASYDEAL_WORKSPACE_DIR")
+    if workspace:
+        return os.path.join(workspace, ".easydeal", "backtests.json")
+    return None
+
+
+def _serialize_bt(bt_id: str, bt: dict) -> dict:
+    """Strip non-serializable fields (Popen handle) and flatten into a
+    JSON-safe record. We DO persist `report_candidates` and `spawn_cwd`
+    because get_backtest_status needs them to finalise records loaded
+    from disk after the spawning MCP child process has died.
+
+    时间戳字段统一用 `... or 0`（None → 0）—— 0.1.69 之前 _record_preflight_failure
+    / _spawn_backtest_now 在异常路径下偶尔留 started_at=None 进盘，下次 load 后
+    任意一处 sort/comparison 直接 TypeError「'<' not supported between instances
+    of 'NoneType' and 'float'」，且 traceback 被吃掉只剩单行 ERROR 没法定位。
+    根治：写盘 + 内存层面都不再允许 None 时间戳，下游任何比较都能安全跑。"""
+    return {
+        "id":               bt_id,
+        "ea":               bt.get("ea"),
+        "symbol":           bt.get("symbol"),
+        "period":           bt.get("period"),
+        "from_date":        bt.get("from_date"),
+        "to_date":          bt.get("to_date"),
+        "deposit":          bt.get("deposit"),
+        "leverage":         bt.get("leverage"),
+        "currency":         bt.get("currency"),
+        "started_at":       bt.get("started_at") or 0,
+        "queued_at":        bt.get("queued_at") or 0,
+        "finished_at":      bt.get("finished_at") or 0,
+        "status":           bt.get("status"),
+        "exit_code":        bt.get("exit_code"),
+        "metrics":          bt.get("metrics"),
+        "report_path":      bt.get("report_path"),
+        "error":            bt.get("error"),
+        "viewed":           bt.get("viewed", False),
+        # Inputs the user / Claude provided to this run — useful for
+        # reviewing "what did this backtest actually test?"
+        "input_overrides":  bt.get("input_overrides") or {},
+        "account":          bt.get("account") or None,
+        # Cross-process resume fields — let get_backtest_status finalise a
+        # disk-loaded record without the original Popen handle.
+        "report_candidates": bt.get("report_candidates"),
+        "spawn_cwd":         bt.get("spawn_cwd"),
+        # spawn 进程 PID — 客户端「取消」按钮用这个直接 taskkill，
+        # 不用绕到 MCP 工具调用。Popen 句柄持久不了（进程退出后失效），
+        # 但 PID 跨重启仍然可以查存活 + kill。
+        "pid":               bt.get("pid"),
+    }
+
+
+def _load_persisted_backtests() -> dict:
+    p = _backtests_file()
+    if not p or not os.path.isfile(p):
+        return {"by_ea": {}}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"by_ea": {}}
+
+
+def _ensure_backtests_loaded():
+    """Lazy first-use load of the persistent backtests.json into the in-memory
+    `_backtests` dict. Without this, every fresh MCP child process spawned by
+    Claude Code starts with an empty dict and `list_backtests` reports zero
+    history — even though backtests.json on disk has dozens of records.
+
+    We do it lazily (on first list/get/run call) because the stdio MCP server
+    starts before module-level init makes sense, and MetaTrader5 / mt5 module
+    interactions during import are messy. Idempotent — guarded by a flag."""
+    global _backtests_loaded_from_disk
+    if _backtests_loaded_from_disk:
+        return
+    _backtests_loaded_from_disk = True
+    persisted = _load_persisted_backtests()
+    by_ea = (persisted or {}).get("by_ea") or {}
+    for ea, lst in by_ea.items():
+        for r in lst:
+            bt_id = r.get("id")
+            if not bt_id or bt_id in _backtests:
+                continue
+            # Disk record is a flat snapshot — copy fields into in-memory
+            # shape. proc handle stays absent (this is past-state, not live).
+            rec = dict(r)
+            # 兜底：早期版本写过 None 进盘（preflight failure 路径 + spawn 失败
+            # 路径）。任何后续 sort 或 (time.time() - x) 都会 None vs float 炸。
+            # 加载时一次性 normalize 掉，让所有下游都能安全走 or 0 / 算术。
+            for ts_field in ("started_at", "queued_at", "finished_at"):
+                if rec.get(ts_field) is None:
+                    rec[ts_field] = 0
+            _backtests[bt_id] = rec
+            # Old records used spawn_cmd as a list — keep as-is, _spawn checks.
+    # If we accidentally over-loaded beyond our cap, trim newest-N.
+    if len(_backtests) > _BT_KEEP * 4:
+        _trim_backtests()
+
+
+def _save_persisted_backtests():
+    """Snapshot the merged in-memory + on-disk state. Records on disk that
+    aren't currently in _backtests are kept (history); records in memory
+    overwrite their disk counterparts (latest state)."""
+    p = _backtests_file()
+    if not p:
+        return
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        existing = _load_persisted_backtests()
+        by_ea: dict[str, list[dict]] = existing.get("by_ea", {}) or {}
+        # Index existing entries by id for fast update
+        index: dict[str, tuple[str, int]] = {}  # id -> (ea, index_in_list)
+        for ea, lst in by_ea.items():
+            for i, e in enumerate(lst):
+                if e.get("id"):
+                    index[e["id"]] = (ea, i)
+
+        for bt_id, bt in _backtests.items():
+            rec = _serialize_bt(bt_id, bt)
+            ea = rec.get("ea") or "_unknown"
+            if bt_id in index:
+                old_ea, idx = index[bt_id]
+                if old_ea == ea:
+                    by_ea[old_ea][idx] = rec
+                else:
+                    # Strategy renamed? Move it
+                    del by_ea[old_ea][idx]
+                    by_ea.setdefault(ea, []).insert(0, rec)
+            else:
+                by_ea.setdefault(ea, []).insert(0, rec)
+                index[bt_id] = (ea, 0)
+
+        # Sort each EA's list by started_at desc, cap at 30
+        for ea in by_ea:
+            by_ea[ea].sort(key=lambda x: x.get("started_at") or 0, reverse=True)
+            by_ea[ea] = by_ea[ea][:_BT_KEEP]
+
+        out = {"by_ea": by_ea, "saved_at": int(time.time())}
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+    except Exception as exc:
+        logging.warning("[backtests] save failed: %s", exc)
+
+
+def _mt5_login_dialog_visible() -> bool:
+    """Best-effort detection: any visible top-level window whose title looks
+    like the MT5 login confirm dialog. Used to surface a 'go click login'
+    hint while a backtest is stuck waiting on it. Windows-only."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        found = []
+
+        def cb(hwnd, _lparam):
+            try:
+                if not u32.IsWindowVisible(hwnd):
+                    return True
+                length = u32.GetWindowTextLengthW(hwnd)
+                if length == 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                u32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value or ""
+                # Match the MT5 login window. The title varies by language —
+                # e.g. "登录交易账户", "Authorization", "Account login".
+                low = title.lower()
+                if (
+                    "登录" in title or "登入" in title or
+                    "authorization" in low or "account login" in low or
+                    "trading account" in low and "login" in low
+                ):
+                    # Restrict to MT5-owned windows by class name to avoid
+                    # false positives (Windows logon, browser tabs, etc.)
+                    cls = ctypes.create_unicode_buffer(64)
+                    u32.GetClassNameW(hwnd, cls, 64)
+                    if cls.value and ("MQ4" in cls.value or "Login" in cls.value or "Dialog" in cls.value):
+                        found.append(title)
+            except Exception:
+                pass
+            return True
+
+        u32.EnumWindows(EnumWindowsProc(cb), 0)
+        return bool(found)
+    except Exception:
+        return False
+
+
+def _resolve_mt5_install_dir() -> str | None:
+    env = os.getenv("EASYDEAL_MT5_INSTALL_DIR")
+    if env and os.path.isdir(env):
+        return env
+    try:
+        info = mt5.terminal_info()
+        if info and info.path and os.path.isdir(info.path):
+            return info.path
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_mt5_data_dir() -> str | None:
+    env = os.getenv("EASYDEAL_MT5_DATA_DIR")
+    if env and os.path.isdir(env):
+        return env
+    try:
+        info = mt5.terminal_info()
+        if info and info.data_path and os.path.isdir(info.data_path):
+            return info.data_path
+    except Exception:
+        pass
+    return None
+
+
+def _build_tester_ini(*, ea, symbol, period, from_date, to_date,
+                      deposit, leverage, currency, overrides, report_name,
+                      login=None, server=None):
+    """Compose an MT5 tester INI. MT5 expects YYYY.MM.DD dates.
+
+    `login` + `server` MUST be supplied — MT5's tester refuses to start
+    without an account ("tester not started because the account is not
+    specified"). When the spawned terminal instance has saved credentials
+    for that login (origin.dat), no password prompt is needed.
+    """
+    from_d = str(from_date).replace("-", ".")
+    to_d = str(to_date).replace("-", ".")
+    leverage_str = f"1:{int(leverage)}"
+
+    # MT5 build 5xxx 实测：Login / Server **必须放在 [Tester] 段** —— 只放
+    # [Common] 时 tester 启动会立刻报「tester not started because the
+    # account is not specified」并退出。[Common] 段的 Login/Server 是给
+    # 终端主连接用的，跟 tester 是独立通道。诊断用户 EZDL-KSBF-7BHR 的
+    # tester_log_tails 直接抓到这条错误日志才定位的。
+    # 双段都写：[Common] 让 MT5 终端先登录，[Tester] 给 tester 显式账号。
+    # Password 不写 —— accounts.dat（portable bootstrap 时已写盘）会按
+    # Login 号查到 hashed password。
+    lines = ["[Common]"]
+    if login:
+        lines.append(f"Login={login}")
+    else:
+        lines.append("Login=")
+    if server:
+        lines.append(f"Server={server}")
+    lines += [
+        "ProxyEnable=0",
+        "",
+        "[Tester]",
+        f"Expert={ea}",
+        f"Symbol={symbol}",
+        f"Period={period}",
+    ]
+    if login:
+        lines.append(f"Login={login}")
+    if server:
+        lines.append(f"Server={server}")
+    lines += [
+        "Optimization=0",
+        # Model 2 = OHLC on M1 (a good speed/accuracy trade-off; "every tick"
+        # is more accurate but much slower).
+        "Model=2",
+        f"FromDate={from_d}",
+        f"ToDate={to_d}",
+        "ForwardMode=0",
+        f"Deposit={int(deposit)}",
+        f"Currency={currency}",
+        f"Leverage={leverage_str}",
+        "ExecutionMode=0",
+        "ShutdownTerminal=1",
+        "Replace=1",
+        "Visual=0",
+        f"Report={report_name}",
+        "",
+    ]
+    if overrides:
+        lines.append("[TesterInputs]")
+        for k, v in overrides.items():
+            if v is True:
+                lines.append(f"{k}=true")
+            elif v is False:
+                lines.append(f"{k}=false")
+            else:
+                lines.append(f"{k}={v}")
+    return "\n".join(lines)
+
+
+def _write_ini(path: str, content: str):
+    # MT5 reads INIs as UTF-16 LE with BOM.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"\xff\xfe")  # UTF-16 LE BOM
+        f.write(content.encode("utf-16-le"))
+
+
+def _read_log_utf16_or_utf8(path: str) -> str | None:
+    """Read MT5 log file. Newer MT5 builds write UTF-16 LE w/ BOM;
+    very old or agent logs sometimes UTF-8. Best effort, returns None on
+    miss. Logs can be large — caller should pass back only what's needed."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except (FileNotFoundError, PermissionError):
+        return None
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        for enc in ("utf-16", "utf-16-le"):
+            try:
+                return data.decode(enc, errors="ignore")
+            except Exception:
+                continue
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def _backtest_next_steps_from_hint(hint: str | None) -> list[str]:
+    """Map a postmortem hint to specific next steps. Generic fallback when
+    hint is None/unknown."""
+    if not hint:
+        return [
+            "MT5 → 视图 → 工具箱 → 日志 看具体报错（也可看上面 log_lines）",
+            "确认 EA 已经编译（检查 MT5/Experts/<EA>.ex5 是否存在 + 文件不是 0 字节）",
+            "确认品种 / 周期 / 日期范围 MT5 真有历史数据（工具箱 → 历史中心）",
+            "如果还无法定位，把 log_files_checked 路径里的最近一个文件发给 AI 让它读完整内容",
+        ]
+    if "账号" in hint:
+        return [
+            "客户端窗口 → 设置 tab → 回测环境 卡片",
+            "确认步骤 2「副本目录已登录 demo 账号」标记是绿色的",
+            "如果不是绿色 → 点「保存并启动登录（/portable）」→ 在弹出的 MT5 里手动登一次 demo 号 → **必须勾「保存账户信息」** → 关掉",
+            "回客户端，新开一条对话再发回测请求（已开的对话拿的是旧 env，不会热加载）",
+        ]
+    if "历史数据" in hint:
+        return [
+            "打开你回测用的那个副本 MT5（不是主 MT5）",
+            "工具栏 → 工具箱 → 历史中心（或按 F2）",
+            "找到回测要用的品种 → 双击 → 「下载」按钮拉完整历史",
+            "下完关掉副本 MT5，回客户端再发回测",
+        ]
+    if "品种名错" in hint:
+        return [
+            "**注意**：mcp__easydeal__get_market_info 查的是【主 MT5】（用户日常交易那个）的品种 —— 如果回测 MT5 接的是不同 broker（例如主 = Exness 加 m 后缀，回测 = MetaQuotes-Demo 不加后缀），这两个的品种名表是不一样的。",
+            "如果上面 hint 提示了「跨 broker」 → 让用户手动打开**回测 MT5**（不是主 MT5）→ 视图 → 市场观察（Ctrl+M）→ 右键空白 → 显示全部 → 把黄金那条的全名发给你（Exness/Tickmill/IC Markets 各家叫法都不同）",
+            "或者直接换几个常见名试一遍 retry：XAUUSD、GOLD、XAU/USD、XAUUSD.x、XAUUSD.r —— 第一个能跑通的就是对的",
+            "把 symbol 参数换成正确的全名后重新发起 run_backtest",
+        ]
+    if "EA" in hint and "编译" in hint:
+        return [
+            "调 mcp__easydeal__compile_strategy(name='<EA>') 重新编译",
+            "看返回的 stderr / stdout 里的 error 行 — 修源码后再回测",
+        ]
+    if "锁" in hint:
+        return [
+            "看任务管理器里有几个 terminal64.exe 在跑",
+            "如果回测副本目录的 MT5 是 zombie，手动关掉",
+            "如果是主 MT5 占着 → 配「回测环境」卡片建独立副本（步骤 1）",
+        ]
+    return [
+        "按上面 hint 给的方向定位",
+        "把 log_lines 里的具体报错发给 AI 帮你诊断",
+    ]
+
+
+def _collect_backtest_postmortem(install_dir: str, started_at: float, *,
+                                  max_lines: int = 8,
+                                  max_chars_per_line: int = 240) -> dict:
+    """Look at MT5 logs from the failed backtest's install dir, return the
+    likely root cause as a structured dict so the run_backtest /
+    get_backtest_status response carries actionable detail instead of just
+    "spawn 死了，没生成报告".
+
+    Why this exists: when a backtest spawn dies without producing a report,
+    we historically returned a generic message. Users (and Claude
+    paraphrasing the tool response) then say "失败了，可能凭据 / 历史数据
+    / 参数错误" — useless. MT5 actually writes the precise reason to its
+    logs (account not found, symbol missing, EA not found, history file
+    corrupted, etc.). This walks the right log paths post-spawn-time and
+    extracts the relevant lines.
+
+    Log locations checked, in order of usefulness:
+      1. <install>/Tester/logs/<YYYYMMDD>.log  — tester's own log (best)
+      2. <install>/Tester/Logs/<YYYYMMDD>.log  — older MT5 capitalisation
+      3. <install>/Tester/Agent-127.0.0.1-3000/logs/<YYYYMMDD>.log
+      4. <install>/Logs/<YYYYMMDD>.log  — terminal log (lock / login errors)
+      5. <install>/MQL5/Logs/<YYYYMMDD>.log  — EA-side log (compile errors)
+
+    Returns: {"hint": "<short human reason>", "log_lines": [...],
+              "log_files_checked": [...]}.
+    """
+    if not install_dir or not os.path.isdir(install_dir):
+        return {"hint": None, "log_lines": [], "log_files_checked": []}
+    # We only care about lines written AFTER the spawn began.
+    # Subtract 5s for clock drift safety.
+    cutoff = max(0, (started_at or 0) - 5)
+    today = time.strftime("%Y%m%d", time.localtime())
+    yesterday = time.strftime("%Y%m%d", time.localtime(time.time() - 86400))
+    candidates = []
+    for sub in (
+        ["Tester", "logs"], ["Tester", "Logs"],
+        ["Tester", "Agent-127.0.0.1-3000", "logs"],
+        ["Tester", "Agent-127.0.0.1-3000", "Logs"],
+        ["Logs"],
+        ["MQL5", "Logs"],
+    ):
+        for d in (today, yesterday):
+            candidates.append(os.path.join(install_dir, *sub, f"{d}.log"))
+
+    # Keywords that strongly indicate the actual failure cause. Order =
+    # priority (first matched line wins). 0.2.8: 把"用户能修"的具体错（品种 /
+    # 账号 / 历史数据 / 编译）放最前面 —— 之前 disconnected / connection
+    # 排在前面，每次 tester 退出都会顺带写一条 "Core 01 disconnected"，
+    # postmortem 命中那条就报「网络问题」，盖过了真正的「symbol does not
+    # exist」根因。重排后即使日志里同时有断连和品种错，hint 优先选品种错。
+    error_patterns = [
+        # === 最高优先：品种 / EA / 数据这类用户立刻能定位的 ===
+        ("symbol does not exist",         "品种名错 — broker 全列表里没这个品种"),
+        ("symbol not exist",              "品种名错 — broker 全列表里没这个品种"),
+        ("symbol unknown",                "品种名错 — broker 全列表里没这个品种"),
+        ("expert was not loaded",         "EA 没装上 — .ex5 文件可能丢了 / 损坏；重新编译试试"),
+        ("compilation error",             "EA 编译失败 — 源码语法有问题，重新编译试试"),
+        ("no history",                    "历史数据缺失 — 这个品种 / 周期在指定日期范围内没数据，去 MT5 工具箱『历史中心』下载"),
+        ("data not synchronized",         "历史数据没同步 — MT5 工具箱『历史中心』下载完整历史再试"),
+        ("missing data",                  "历史数据缺失 — 同上，去『历史中心』下载"),
+        ("file not found",                "文件缺失 — 可能 .ex5 没编译成功；先跑 compile_strategy 再回测"),
+        # === 次高：账号 / 凭据 / 锁 ===
+        ("account is not specified",      "回测账号没指定 — 可能 accounts.dat 没生成或 LOGIN/SERVER env 没传到 tester"),
+        ("not specified",                 "回测账号没指定 — 可能 accounts.dat 没生成或 LOGIN/SERVER env 没传到 tester"),
+        ("invalid account",               "回测账号无效 / 已禁用 — 检查账号有没有过期，或换一个 demo 号"),
+        ("incorrect password",            "密码错 — accounts.dat 缓存过期，重新「保存并启动登录」一次"),
+        ("authorization failed",          "登录服务器失败 — 网络问题 / 账号密码错 / 服务器名错"),
+        ("login failed",                  "登录失败 — 看下面具体行"),
+        ("locked",                        "数据目录被锁 — 另一个 MT5 实例在用同一个目录，关掉再试"),
+        ("access denied",                 "权限拒绝 — 安装目录可能在 Program Files 下需要管理员；移到普通目录或用 portable"),
+        # === 最低：网络断连 / 一般"not found" ===
+        # 这些放最后，因为 tester 退出时几乎必报 disconnected，但那不是根因。
+        ("disconnected",                  "MT5 跟服务器断了连接 — 网络问题 / 服务器故障"),
+        # 下面的 None hint 只用来高亮上下文行，不作为最终 hint
+        ("expert ",                       None),
+        ("not found",                     None),
+        ("connection",                    None),
+    ]
+
+    # 0.2.8: 按行的时间戳过滤"早于 spawn"的内容。MT5 日志是 daily 文件
+    # （20260510.log），同一文件可能既有今天 09:00 旧 tester 跑过的 trace，
+    # 又有 15:05 新 spawn 的 trace。光按 file mtime 过滤不够 —— 文件 mtime
+    # 是 15:06（新写过），但前 200 行 tail 里仍夹着 09:xx 的 disconnected
+    # 旧记录，会误命中。每行都拿前缀的 HH:MM:SS.mmm 跟 spawn time 比，比
+    # spawn 早的整行跳过。
+    log_date = today  # 用今天的日期 + 行内 HH:MM:SS 拼出绝对时间
+    spawn_lt = time.localtime(cutoff) if cutoff else None
+
+    def _line_after_spawn(line: str) -> bool:
+        """MT5 line 形如 `RL\t0\t15:00:39.609\t...` —— 第 3 个 tab 字段是
+        HH:MM:SS.mmm 钟点。如果文件名是今天，把这个钟点拼成今天的时间戳，
+        跟 spawn cutoff 比；早于 spawn 的 → False（跳过）。日期跨天的 corner
+        case 简化处理：tail 倒数 200 行里基本不会跨天，直接用今天日期。
+        无法解析时间的行（不是标准 MT5 trace 格式）→ 返回 True 保留。"""
+        if not spawn_lt:
+            return True
+        try:
+            parts = line.split("\t", 3)
+            if len(parts) < 3:
+                return True
+            t_field = parts[2]   # HH:MM:SS.mmm
+            hh = int(t_field[0:2]); mm = int(t_field[3:5]); ss = int(t_field[6:8])
+            # 拼今天的时间戳
+            line_t = time.mktime((
+                spawn_lt.tm_year, spawn_lt.tm_mon, spawn_lt.tm_mday,
+                hh, mm, ss, 0, 0, -1
+            ))
+            return line_t >= cutoff
+        except Exception:
+            return True
+
+    captured_lines: list[str] = []
+    files_checked: list[str] = []
+    best_hint: str | None = None
+    seen = set()
+    for fp in candidates:
+        if fp in seen:
+            continue
+        seen.add(fp)
+        if not os.path.isfile(fp):
+            continue
+        files_checked.append(fp)
+        try:
+            mtime = os.path.getmtime(fp)
+            if mtime < cutoff:
+                continue
+        except Exception:
+            continue
+        text = _read_log_utf16_or_utf8(fp) or ""
+        if not text:
+            continue
+        # 取尾部 600 行 + 行级时间过滤（之前 200 行 + 无时间过滤会让旧
+        # session 的 disconnected 行盖掉新 session 的真错因）。
+        tail_lines = text.splitlines()[-600:]
+        for line in tail_lines:
+            ln = (line or "").strip()
+            if not ln:
+                continue
+            if not _line_after_spawn(ln):
+                continue
+            # Lower-cost match
+            ln_lower = ln.lower()
+            for kw, hint in error_patterns:
+                if kw.lower() in ln_lower:
+                    if hint and best_hint is None:
+                        best_hint = hint
+                    if len(captured_lines) < max_lines:
+                        captured_lines.append(ln[:max_chars_per_line])
+                    break
+    return {
+        "hint": best_hint,
+        "log_lines": captured_lines,
+        "log_files_checked": files_checked[:8],
+    }
+
+
+def _read_report(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return None
+    # MT5 reports are usually UTF-16 LE
+    for enc in ("utf-16", "utf-16-le", "utf-8"):
+        try:
+            return data.decode(enc, errors="ignore")
+        except Exception:
+            continue
+    return None
+
+
+def _parse_html_report(html: str) -> dict:
+    """Best-effort extraction of headline metrics from a MT5 tester HTML
+    report. Layout/locale varies by MT5 build:
+
+      - English locale (older docs, generic build):
+            <td>Total Net Profit:</td><td>1234</td>
+      - Chinese locale (Exness MT5 5xxx, what the user actually sees):
+            <td>总净盈利:</td><td><b>4 649.67</b></td>
+        Note the <b>...</b> wrapper around the value cell, AND space as
+        thousands separator ("4 649.67" not "4,649.67").
+
+    We accept both label languages AND both value-cell layouts, return
+    whichever sticks."""
+
+    def find(label_variants):
+        for label in label_variants:
+            # Two patterns for the value cell — bare or wrapped in <b>:
+            #   <td>label:</td><td>VALUE</td>
+            #   <td>label:</td><td><b>VALUE</b></td>
+            for value_inner in (r"\s*<b[^>]*>\s*([^<]+?)\s*</b>\s*",
+                                r"\s*([^<]+?)\s*"):
+                m = re.search(
+                    rf"<td[^>]*>\s*{re.escape(label)}\s*:?\s*</td>\s*<td[^>]*>{value_inner}</td>",
+                    html, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip()
+        return None
+
+    def num(s):
+        if s is None:
+            return None
+        # MT5 thousands-separator: space ("4 649.67"). Also strip commas & nbsp.
+        s = s.strip().replace(",", "").replace("\xa0", "").replace(" ", "")
+        s = s.replace("&nbsp;", "")
+        # parenthesized = negative
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1]
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    def pct_inside(s):
+        if s is None:
+            return None
+        # "735.18 (4.94%)" or "(4.94%)"
+        m = re.search(r"\(\s*([\d.]+)\s*%\s*\)", s)
+        if m:
+            return float(m.group(1)) / 100.0
+        # "4.94% (735.18)" or "4.94%"
+        m2 = re.match(r"\s*([\d.]+)\s*%", s)
+        if m2:
+            return float(m2.group(1)) / 100.0
+        return None
+
+    def num_before_paren(s):
+        """Extract leading number from values like '735.18 (4.94%)' →
+        735.18. Falls back to plain num() for values without parens."""
+        if s is None:
+            return None
+        # Strip parenthesised tail, then num()
+        head = re.split(r"\s*\(", s, maxsplit=1)[0]
+        return num(head)
+
+    def int_count(s):
+        if s is None:
+            return None
+        # "44" or "23 (61.90%)" — take the leading integer
+        m = re.match(r"\s*(\d+)\s*", s)
+        if m:
+            return int(m.group(1))
+        return None
+
+    metrics = {
+        "net_profit":       num(find(["Total Net Profit", "总净盈利"])),
+        "gross_profit":     num(find(["Gross Profit", "毛利", "总盈利"])),
+        "gross_loss":       num(find(["Gross Loss", "毛损", "总亏损"])),
+        "profit_factor":    num(find(["Profit Factor", "盈利因子"])),
+        "expected_payoff":  num(find(["Expected Payoff", "预期收益"])),
+        "sharpe":           num(find(["Sharpe Ratio", "夏普比率"])),
+        "recovery_factor":  num(find(["Recovery Factor", "采收率", "恢复因子"])),
+        # Drawdown values look like "735.18 (4.94%)" — strip $ vs %
+        "max_drawdown_abs": num_before_paren(
+            find(["Balance Drawdown Maximal", "Maximal Drawdown",
+                  "最大结余亏损", "最大净值亏损", "平衡资金回撤最大值"])
+        ),
+        "max_drawdown_pct": pct_inside(
+            find(["Balance Drawdown Relative", "相对结余亏损", "相对净值亏损",
+                  "Balance Drawdown Maximal", "最大结余亏损", "最大净值亏损"])
+        ),
+        "trades":           int_count(find(["Total Trades", "交易总计", "总交易"])),
+        "wins":             int_count(find(["Profit Trades (% of total)", "Profit Trades",
+                                            "盈利交易 (% 全部)", "盈利交易"])),
+        "losses":           int_count(find(["Loss Trades (% of total)", "Loss Trades",
+                                            "亏损交易 (% 全部)", "亏损交易"])),
+        "win_rate":         pct_inside(find(["Profit Trades (% of total)",
+                                             "盈利交易 (% 全部)"])),
+    }
+    return {k: v for k, v in metrics.items() if v is not None}
+
+
+def _trim_backtests():
+    if len(_backtests) <= _BT_KEEP:
+        return
+    # 用 `.get(...) or 0` 而不是 `.get(..., 0)` —— 后者 default 只在 key 缺失
+    # 时生效；record 里 started_at 显式 None 时仍是 None，sort 比较 None vs
+    # float 直接 TypeError「'<' not supported between instances of 'NoneType'
+    # and 'float'」。其他几处 sort（_save_persisted_backtests / _queue_position
+    # / _schedule_pending_backtests）都用 or 0 防御过了，这里漏了。
+    by_started = sorted(_backtests.items(), key=lambda kv: (kv[1].get("started_at") or 0), reverse=True)
+    keep_ids = {bt_id for bt_id, _ in by_started[:_BT_KEEP]}
+    for bt_id in list(_backtests):
+        if bt_id not in keep_ids:
+            _backtests.pop(bt_id, None)
+
+
+def _record_preflight_failure(ea: str, symbol: str, period: str,
+                              from_date: str, to_date: str,
+                              deposit, leverage, currency: str,
+                              error_code: str, error_msg: str) -> None:
+    """Persist a backtest 'config_error' record so the UI's 回测历史 panel
+    shows what happened. Without this, the user clicks 回测, MCP aborts
+    via a preflight, and the 回测历史 panel shows nothing new — making
+    them think their click did nothing."""
+    try:
+        bt_id = f"bt_{int(time.time() * 1000):x}"
+        now = time.time()
+        _backtests[bt_id] = {
+            "id": bt_id, "ea": ea, "symbol": symbol, "period": period,
+            "from_date": from_date, "to_date": to_date,
+            "deposit": deposit, "leverage": leverage, "currency": currency,
+            # 时间戳一律用 float（0 表示 N/A）—— 不留 None，避免 sort 时
+            # None vs float TypeError。
+            "started_at": now, "queued_at": 0, "finished_at": now,
+            "status": "config_error",
+            "exit_code": None, "metrics": None, "report_path": None,
+            "error_code": error_code,
+            "error": error_msg,
+            "viewed": False,
+        }
+        _trim_backtests()
+        _save_persisted_backtests()
+    except Exception:
+        pass   # best-effort — don't let a record-keeping bug mask the real error
+
+
+def _run_backtest_tool(args: dict) -> list[TextContent]:
+    _ensure_backtests_loaded()
+    ea = (args.get("ea_name") or "").strip()
+    symbol = (args.get("symbol") or "").strip()
+    period = (args.get("period") or "").strip().upper()
+    from_date = (args.get("from_date") or "").strip()
+    to_date = (args.get("to_date") or "").strip()
+    deposit = args.get("deposit", 10000) or 10000
+    leverage = args.get("leverage", 100) or 100
+    currency = (args.get("currency") or "USD").strip()
+    overrides = args.get("input_overrides") or {}
+
+    if not ea or not symbol or not period or not from_date or not to_date:
+        return [TextContent(type="text", text=json.dumps(
+            {"ok": False, "error": "ea_name / symbol / period / from_date / to_date 必填"},
+            ensure_ascii=False))]
+
+    install_dir = _resolve_mt5_install_dir()
+    data_dir = _resolve_mt5_data_dir()
+
+    # When a SEPARATE backtest MT5 install is configured (recommended —
+    # full isolation from live), redirect the spawn to that one. This is
+    # set by the easydeal-client UI under 设置 → 回测环境. The live
+    # install remains untouched so user's running EAs aren't disturbed.
+    backtest_override = os.getenv("EASYDEAL_BACKTEST_INSTALL_DIR")
+    if backtest_override and os.path.isdir(backtest_override):
+        install_dir = backtest_override
+        # In /portable mode the tester treats install_dir as data_dir.
+        data_dir = backtest_override
+
+    if not install_dir:
+        return [TextContent(type="text", text=json.dumps(
+            {"ok": False, "error": "未找到 MT5 安装目录。请在客户端「设置」→「回测环境」配置回测专用 MT5 路径，或在「实盘登录」启动主 MT5。"},
+            ensure_ascii=False))]
+
+    # 用 terminal64.exe 普通名启动。MT5 自检不允许改名启动（之前曾把副本
+    # 改成 terminal64_backtest.exe 的方案被 ExitCode 10001 否了），这里就只认
+    # 原名 / 32 位老版 terminal.exe 兜底。
+    terminal_exe = None
+    for candidate in ("terminal64.exe", "terminal.exe"):
+        p = os.path.join(install_dir, candidate)
+        if os.path.isfile(p):
+            terminal_exe = p
+            break
+    if not terminal_exe:
+        return [TextContent(type="text", text=json.dumps(
+            {"ok": False, "error": f"terminal64.exe 不在 {install_dir} — 先在客户端做步骤 1：复制主 MT5 → 副本"},
+            ensure_ascii=False))]
+
+    # Decide portable vs attached mode early so the rest of the function
+    # can branch on it. (NOTE: this used to be defined further down, which
+    # caused a NameError when `primary_experts_dir` referenced it. Moved up.)
+    #
+    #   PORTABLE mode (preferred): dedicated demo account, auto-login from
+    #     <install>/origin.dat. Triggered by EASYDEAL_BACKTEST_PORTABLE=1 +
+    #     LOGIN/SERVER env vars + origin.dat present in the spawn install dir.
+    #   ATTACHED mode (fallback): use the currently-running MT5's account.
+    # Decide whether we have a viable backtest configuration BEFORE spawning.
+    # Three states:
+    #   1. portable_intended + origin.dat present → use_portable=True, all set
+    #   2. portable_intended + origin.dat MISSING → return setup error (need bootstrap)
+    #   3. no portable env at all → fall through to attached mode (will fail
+    #      against a running live MT5 due to data-dir lock — also surface this)
+    portable_intended = (
+        os.getenv("EASYDEAL_BACKTEST_PORTABLE") == "1"
+        and os.getenv("EASYDEAL_BACKTEST_LOGIN")
+        and os.getenv("EASYDEAL_BACKTEST_SERVER")
+    )
+    # Newer MT5 builds save login state at Config/accounts.dat instead of
+    # the legacy origin.dat — check either one.
+    origin_dat   = os.path.join(install_dir, "origin.dat")
+    accounts_dat = os.path.join(install_dir, "Config", "accounts.dat")
+    has_credentials = os.path.isfile(origin_dat) or os.path.isfile(accounts_dat)
+    use_portable = portable_intended and has_credentials
+
+    # Preflight error: portable was intended but credentials weren't bootstrapped.
+    # This is THE specific configuration error users hit most often. Tell them
+    # exactly which UI button to click — no generic "check this and that".
+    if portable_intended and not has_credentials:
+        _record_preflight_failure(ea, symbol, period, from_date, to_date,
+                                   deposit, leverage, currency,
+                                   "backtest_credentials_missing",
+                                   "缺 Config/accounts.dat — 还没 bootstrap 回测账号登录")
+        return [TextContent(type="text", text=json.dumps({
+            "ok": False,
+            "error_code": "backtest_credentials_missing",
+            "error": ("回测账号还没在 portable 模式下登录过 — 安装目录里"
+                      "没有缓存的登录凭据 (Config/accounts.dat)。"),
+            "diagnostic": {
+                "install_dir":           install_dir,
+                "expected_accounts_dat": accounts_dat,
+                "backtest_login":        os.getenv("EASYDEAL_BACKTEST_LOGIN"),
+                "backtest_server":       os.getenv("EASYDEAL_BACKTEST_SERVER"),
+            },
+            "next_steps": [
+                "客户端窗口 → 设置 tab → 回测环境 卡片",
+                "确认账号 / 服务器已经填好（建议 Exness 模拟账号）",
+                "点「保存并启动登录（/portable）」按钮",
+                "弹出来的 MT5 里：文件 → 登录到交易账户 → 输账号密码 →",
+                "  勾「保存账户信息」→ 登录 → **完全退出 MT5**（右上角 X 关掉）",
+                f"完成后凭据会出现在 {accounts_dat}",
+                "回客户端再点一次「检测就绪」确认绿色 ✓",
+                "之后所有回测自动用这套配置，不用再手动登录",
+            ],
+        }, ensure_ascii=False))]
+
+    # In portable mode the tester reads/writes inside install_dir; otherwise
+    # it uses the standard data_dir under %APPDATA%. Pick the right Experts/
+    # location accordingly so deploy + compile lands where the tester reads.
+    primary_experts_dir = (
+        os.path.join(install_dir, "MQL5", "Experts") if use_portable
+        else (os.path.join(data_dir, "MQL5", "Experts") if data_dir
+              else os.path.join(install_dir, "MQL5", "Experts"))
+    )
+
+    # Verify EA is compiled. Check primary first, then alternates.
+    ex5_candidates = [os.path.join(primary_experts_dir, f"{ea}.ex5")]
+    if data_dir and primary_experts_dir != os.path.join(data_dir, "MQL5", "Experts"):
+        ex5_candidates.append(os.path.join(data_dir, "MQL5", "Experts", f"{ea}.ex5"))
+    if primary_experts_dir != os.path.join(install_dir, "MQL5", "Experts"):
+        ex5_candidates.append(os.path.join(install_dir, "MQL5", "Experts", f"{ea}.ex5"))
+    ex5_path = next((p for p in ex5_candidates if os.path.isfile(p)), None)
+
+    # Auto-deploy: if no .ex5 exists yet, look for the .mq5 source in the
+    # workspace's strategies/ dir (or already in MT5 Experts), copy it into
+    # MT5 Experts, and compile via MetaEditor. This makes the chat-driven
+    # "create EA → backtest" flow seamless: the user shouldn't have to
+    # manually copy files between dirs.
+    if not ex5_path:
+        deploy_log: list[str] = []
+        deploy_target_dir = primary_experts_dir
+        os.makedirs(deploy_target_dir, exist_ok=True)
+        target_mq5 = os.path.join(deploy_target_dir, f"{ea}.mq5")
+
+        # Source candidate paths
+        workspace_dir = os.getenv("EASYDEAL_WORKSPACE_DIR")
+        mq5_candidates = []
+        if workspace_dir:
+            mq5_candidates.append(os.path.join(workspace_dir, "strategies", f"{ea}.mq5"))
+        mq5_candidates.append(os.path.join(deploy_target_dir, f"{ea}.mq5"))
+
+        src_mq5 = next((p for p in mq5_candidates if os.path.isfile(p)), None)
+        if not src_mq5:
+            return [TextContent(type="text", text=json.dumps(
+                {"ok": False,
+                 "error": f"未找到 {ea}.ex5 或 .mq5 源码。",
+                 "looked_for_ex5": ex5_candidates,
+                 "looked_for_mq5": mq5_candidates,
+                 "hint": "请先在对话里让 Claude 用 Write 工具把 EA 源码写到 strategies/<EA>.mq5"},
+                ensure_ascii=False))]
+
+        # Copy .mq5 into Experts/ if it isn't already there.
+        if os.path.abspath(src_mq5) != os.path.abspath(target_mq5):
+            import shutil
+            shutil.copy2(src_mq5, target_mq5)
+            deploy_log.append(f"copied {os.path.basename(src_mq5)} → {target_mq5}")
+        else:
+            deploy_log.append(f"using existing {target_mq5}")
+
+        # Compile with MetaEditor
+        metaeditor = _get_metaeditor_path()
+        if not metaeditor or not os.path.isfile(metaeditor):
+            return [TextContent(type="text", text=json.dumps(
+                {"ok": False,
+                 "error": "找不到 MetaEditor64.exe。请在客户端「设置」里设置 MT5 安装目录，或设置 METAEDITOR_PATH 环境变量。",
+                 "deploy_log": deploy_log},
+                ensure_ascii=False))]
+
+        try:
+            import subprocess as _sp
+            compile_cmd = [metaeditor, "/portable", f"/compile:{target_mq5}", f"/log:{target_mq5}.compile.log"]
+            cres = _sp.run(compile_cmd, capture_output=True, timeout=120)
+            deploy_log.append(f"compile rc={cres.returncode}")
+        except _sp.TimeoutExpired:
+            return [TextContent(type="text", text=json.dumps(
+                {"ok": False, "error": "编译超时（>120s）", "deploy_log": deploy_log},
+                ensure_ascii=False))]
+        except Exception as exc:
+            return [TextContent(type="text", text=json.dumps(
+                {"ok": False, "error": f"编译失败：{exc}", "deploy_log": deploy_log},
+                ensure_ascii=False))]
+
+        # Re-check for .ex5
+        target_ex5 = os.path.join(deploy_target_dir, f"{ea}.ex5")
+        if not os.path.isfile(target_ex5):
+            # Read compile log if present
+            compile_log_text = ""
+            log_path = f"{target_mq5}.compile.log"
+            if os.path.isfile(log_path):
+                try:
+                    with open(log_path, "rb") as f:
+                        raw = f.read()
+                    for enc in ("utf-16", "utf-8"):
+                        try:
+                            compile_log_text = raw.decode(enc, errors="ignore")
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            return [TextContent(type="text", text=json.dumps(
+                {"ok": False,
+                 "error": "MetaEditor 编译没有产出 .ex5（语法错？）",
+                 "deploy_log": deploy_log,
+                 "compile_log": compile_log_text[-2000:] if compile_log_text else "(no log)",
+                 "target_ex5": target_ex5},
+                ensure_ascii=False))]
+        ex5_path = target_ex5
+        deploy_log.append(f"compiled → {target_ex5}")
+
+    # Resolve which account the tester logs into. `use_portable` already
+    # determined upstream → derive credentials accordingly.
+    if use_portable:
+        acct_login = int(os.getenv("EASYDEAL_BACKTEST_LOGIN"))
+        acct_server = os.getenv("EASYDEAL_BACKTEST_SERVER")
+    else:
+        acct_login = None
+        acct_server = None
+        try:
+            acct = mt5.account_info()
+            if acct:
+                acct_login = acct.login
+                acct_server = acct.server
+        except Exception:
+            pass
+
+        if not acct_login or not acct_server:
+            _record_preflight_failure(ea, symbol, period, from_date, to_date,
+                                       deposit, leverage, currency,
+                                       "backtest_no_account",
+                                       "回测无可用账号")
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False,
+                "error_code": "backtest_no_account",
+                "error": ("回测无可用账号 —— 既没配回测专用账号（推荐），"
+                          "你日常那个 MT5 也没在线 / Python 没法 attach。"),
+                "diagnostic": {
+                    "portable_env_set":  bool(os.getenv("EASYDEAL_BACKTEST_PORTABLE")),
+                    "origin_dat_exists": os.path.isfile(os.path.join(install_dir, "origin.dat")),
+                    "install_dir":       install_dir,
+                },
+                "next_steps": [
+                    "客户端窗口 → 设置 tab → 回测环境 卡片",
+                    "「回测 MT5 安装目录」留空（用主 MT5 那份即可，不论你日常用的是实盘还是模拟）",
+                    "填回测账号 / 服务器（**用 demo 模拟账号**，回测就别动实盘资金了）",
+                    "点「保存并启动登录（/portable）」按钮",
+                    "弹出的 MT5 里登录回测账号、勾「保存账户信息」、关掉",
+                    "回客户端，下次回测自动用 portable 模式跟主 MT5 并行，不冲突（主 MT5 是实盘还是模拟都不会被影响）",
+                ],
+            }, ensure_ascii=False))]
+
+    # Even with valid account info, attached-mode (no /portable) can fail
+    # silently when live MT5 is running because the spawn fights for the
+    # data-dir lock. Surface this BEFORE we spawn so the user gets useful
+    # guidance instead of an opaque exit_code.
+    if not use_portable and data_dir:
+        # Heuristic: live MT5 has data_dir; if we'd spawn into the same data_dir
+        # without /portable, MT5 will exit immediately with the lock error.
+        try:
+            ti = mt5.terminal_info()
+            live_data_path = ti.data_path if ti else None
+        except Exception:
+            live_data_path = None
+        if live_data_path and os.path.normcase(os.path.abspath(live_data_path)) == \
+                              os.path.normcase(os.path.abspath(data_dir)):
+            _record_preflight_failure(ea, symbol, period, from_date, to_date,
+                                       deposit, leverage, currency,
+                                       "backtest_data_dir_conflict",
+                                       f"你日常那个 MT5 占着相同的数据目录 {data_dir}")
+            # 细化 next_steps —— 命中这个错误意味着 portable_intended=False，
+            # 三种成因（按客户端用户做到哪一步分）：
+            #   A. 完全没配回测环境 (没 EASYDEAL_BACKTEST_INSTALL_DIR + 没 LOGIN/SERVER)
+            #   B. 副本目录建了但还没在副本里登录 demo (INSTALL_DIR 在，accounts.dat 不在)
+            #   C. 副本登录了但「高级」面板账号字段没填 (creds 在，LOGIN/SERVER env 缺)
+            bt_install = os.getenv("EASYDEAL_BACKTEST_INSTALL_DIR")
+            has_creds = False
+            if bt_install:
+                has_creds = (os.path.isfile(os.path.join(bt_install, "Config", "accounts.dat"))
+                          or os.path.isfile(os.path.join(bt_install, "origin.dat")))
+            has_login_env = bool(os.getenv("EASYDEAL_BACKTEST_LOGIN") and os.getenv("EASYDEAL_BACKTEST_SERVER"))
+
+            if not bt_install:
+                case_label = "回测环境完全没配"
+                next_steps = [
+                    "客户端「设置」→ 回测环境 卡片",
+                    "步骤 1「选个目录存副本」→ 留空让客户端自动选 → 点「复制主 MT5 → 副本」",
+                    "步骤 2 启动副本 → **用 demo 模拟号登录**（回测就别拿实盘账号去跑了）→ 必须勾「保存账户信息」→ 关掉",
+                    "步骤 2 「高级」展开 → 填 demo 账号 + 服务器 → 保存",
+                    "步骤 3 检测就绪",
+                    "新开一条对话再发回测请求即可（已开的对话拿的是旧 env，不会热加载）",
+                ]
+            elif not has_creds:
+                case_label = "副本目录建了但还没在副本里登录 demo"
+                next_steps = [
+                    f"副本目录已建：{bt_install}",
+                    "客户端「设置」→ 回测环境 → 步骤 2「启动副本 MT5」",
+                    "弹出的副本 MT5 里：文件 → 登录到交易账户 → **用 demo 模拟号登录**（回测专用，别用实盘号 —— 别拿真钱去跑）",
+                    "⚠ 必须勾「保存账户信息」 → 关掉副本窗口",
+                    "步骤 2「高级」展开 → 填刚才用的 demo 账号 + 服务器 → 保存",
+                    "新开一条对话再发回测请求",
+                ]
+            elif not has_login_env:
+                case_label = "差「高级面板」里账号 / 服务器字段"
+                next_steps = [
+                    f"副本目录 + demo 凭据都已就绪：{bt_install}",
+                    "只差「设置」→ 回测环境 → 步骤 2「高级：手动指定账号 / 服务器」展开里的两个字段",
+                    "账号填步骤 2 你登录副本时用的 demo 账号号（数字）",
+                    "服务器填那个 demo 的服务器名（如 Exness-MT5Trial14）",
+                    "点「保存修改」",
+                    "**新开一条 AI 对话**再发回测请求（关键 — 已开的对话里 MCP 子进程拿的是旧 env，不会热加载）",
+                ]
+            else:
+                # 兜底：env 都齐但还是 use_portable=False，多半 has_credentials 检测出问题
+                case_label = "环境 env 齐全但 use_portable 还是 False（罕见）"
+                next_steps = [
+                    "客户端「设置」→ 回测环境 → 步骤 3 点「检测就绪」看返回，"
+                    "确认 portable_ready=true",
+                    "若不就绪 → 按返回的具体提示修",
+                    "或：临时关掉主 MT5 跑完回测再启动（不推荐 — 主 MT5 上挂的 EA 会中断）",
+                ]
+
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False,
+                "error_code": "backtest_data_dir_conflict",
+                "error": (f"回测会跟正在运行的主 MT5 抢同一个数据目录锁，"
+                          f"spawn 会立即退出 (exit_code 3294954943)。具体卡在：{case_label}。"),
+                "diagnostic": {
+                    "live_data_dir":           live_data_path,
+                    "spawn_data_dir":          data_dir,
+                    "case":                    case_label,
+                    "backtest_install_dir":    bt_install,
+                    "has_credentials":         has_creds,
+                    "has_login_server_env":    has_login_env,
+                },
+                "next_steps": next_steps,
+            }, ensure_ascii=False))]
+
+    # ---- Symbol preflight (CONDITIONAL — 0.2.8 重写) ----
+    # MT5 Python SDK 是单实例 IPC，只能查它当前 attach 的那个 MT5（= 主 MT5
+    # / live MT5）。当回测 broker 跟主 MT5 broker 不同（典型：主 = Exness 用
+    # XAUUSDm，回测 = MetaQuotes-Demo 用 XAUUSD），用主 MT5 SDK 查回测要用的
+    # 品种，会得到错误结论 —— 这就是 EZDL-... 用户反复踩的坑：
+    #   - 用 XAUUSD 跑 → preflight（查 Exness）说"不存在"，建议改 XAUUSDm
+    #   - 用 XAUUSDm 跑 → preflight（查 Exness）说"存在"，spawn 后回测
+    #     MT5（MetaQuotes-Demo）实际报"symbol XAUUSDm not exist"
+    #
+    # 三档逻辑：
+    #   (a) 没活的 MT5 → 跳 preflight，让 tester 自己说存不存在（postmortem
+    #       拿 hint）
+    #   (b) 有活的 MT5 + 回测 broker 跟它**同一个 broker** → 用 SDK 严格校验
+    #       （之前的 candidates fuzzy 匹配那套）
+    #   (c) 有活的 MT5 + 回测 broker **不同**（用 EASYDEAL_BACKTEST_LOGIN 是
+    #       不是 != live login 来判断）→ 跳 preflight + 在 logging 里留警告。
+    #       这种情况 SDK 查到的品种列表对回测来说不算数，强行校验只会误导。
+    try:
+        _live_terminal = mt5.terminal_info()
+    except Exception:
+        _live_terminal = None
+    try:
+        _live_account = mt5.account_info() if _live_terminal is not None else None
+    except Exception:
+        _live_account = None
+
+    _bt_login_env = os.getenv("EASYDEAL_BACKTEST_LOGIN")
+    _live_login = getattr(_live_account, "login", None) if _live_account else None
+    _cross_broker = bool(
+        use_portable
+        and _bt_login_env
+        and _live_login
+        and str(_live_login) != str(_bt_login_env)
+    )
+
+    if _live_terminal is not None and not _cross_broker:
+        try:
+            sym_info = mt5.symbol_info(symbol)
+        except Exception:
+            sym_info = None
+        if not sym_info:
+            import re as _re
+            base = _re.sub(r"[._\-mz0-9]+$", "", symbol).strip() or symbol
+            try:
+                all_syms = mt5.symbols_get(f"*{base}*") or []
+                candidates = sorted(set(s.name for s in all_syms))[:20]
+            except Exception:
+                candidates = []
+            _record_preflight_failure(ea, symbol, period, from_date, to_date,
+                                       deposit, leverage, currency,
+                                       "backtest_symbol_not_found",
+                                       f"品种 {symbol} 不存在 (候选: {', '.join(candidates[:5])})")
+            return [TextContent(type="text", text=json.dumps({
+                "ok": False,
+                "error_code": "backtest_symbol_not_found",
+                "error": f"品种 {symbol} 在当前账户（{acct_server}）的市场观察 / 商品列表里不存在。",
+                "diagnostic": {
+                    "requested_symbol":   symbol,
+                    "broker_server":      acct_server,
+                    "fuzzy_match_count":  len(candidates),
+                    "candidates":         candidates,
+                    "tip": ("很多券商对主流品种加后缀，比如 Exness 用 XAUUSDm / EURUSDm，"
+                            "IC Markets 用 EURUSD.m / GBPUSD.m。直接看 candidates "
+                            "列表，挑最贴近你要测的那一个重新发起 run_backtest。"),
+                },
+                "next_steps": [
+                    f"用 get_market_info / 列表里的 candidates 重新选一个真实存在的品种",
+                    "重新调 run_backtest，把 symbol 参数改成正确的全名",
+                    "（不需要用户去 MT5 里手动加品种，直接换名即可）",
+                ],
+            }, ensure_ascii=False))]
+    elif _cross_broker:
+        # 跨 broker，跳过严格校验。给 Python logger 留一行 + 在工具响应里
+        # 也声明，让 Claude 别误以为我们已经"确认"了品种 —— spawn 后真的
+        # 不存在，就让 postmortem 给确切原因。
+        logging.warning(
+            "[backtest] cross-broker preflight skipped: live login=%s broker=%s != bt login=%s broker=%s; "
+            "symbol %s will be validated by tester at spawn",
+            _live_login, getattr(_live_account, "server", "?"),
+            _bt_login_env, acct_server, symbol,
+        )
+    # else: no live MT5 → symbol check skipped; we trust the user-supplied
+    # symbol. Replica MT5 will validate it on its own when starting tester.
+
+    # ---- Lock-conflict preflight + auto-cleanup ----
+    # In portable mode, the data dir IS the install dir. If a terminal64.exe
+    # is already running with our backtest install_dir as its exe dir, the
+    # new spawn would fight for the same data-dir lock and silently exit.
+    #
+    # Auto-cleanup heuristic:
+    #   - install_dir IS our backtest replica (because we're in /portable
+    #     mode and use_portable=True implies an explicit override or the
+    #     replica was bootstrapped) → the only thing that runs from the
+    #     replica is OUR previous backtest spawns. They sometimes don't
+    #     honour ShutdownTerminal=1 (visual mode, race condition, etc.) →
+    #     leftover process. **Auto-kill is safe** because:
+    #       1. The replica is dedicated to backtesting (separate dir from
+    #          the live install — we refuse to copy onto the live dir)
+    #       2. The user's actual live trading runs from the LIVE install
+    #          (different exe path, different dir)
+    #       3. The killed process is by definition done with its job
+    #          (a still-running tester would either be at "running" status
+    #          in our records, or it's a zombie that's not making progress)
+    #   - If we somehow hit a process whose exe is in the LIVE install
+    #     (shouldn't happen in portable mode because install_dir = replica
+    #     path here, but defensively check) → never kill, abort with the
+    #     classic preflight error so the user manages it.
+    if use_portable:
+        try:
+            import psutil as _psu  # type: ignore
+            inst_norm = os.path.normcase(os.path.abspath(install_dir))
+            killed_pids = []
+            blocking_live_pid = None
+            for p in _psu.process_iter(["name", "exe"]):
+                try:
+                    n = (p.info.get("name") or "").lower()
+                    if n not in ("terminal64.exe", "terminal.exe"):
+                        continue
+                    exe_path = p.info.get("exe") or ""
+                    exe_dir = os.path.dirname(exe_path)
+                    if os.path.normcase(os.path.abspath(exe_dir)) != inst_norm:
+                        continue
+                    # Match — this process is locking our backtest dir.
+                    # Sanity: it MUST be in the replica, NOT the live install.
+                    # (We're in portable mode + install_dir is the spawn target,
+                    # so any match here is by definition a replica process.)
+                    pid = p.pid
+                    try:
+                        p.kill()
+                        killed_pids.append(pid)
+                    except (_psu.NoSuchProcess, _psu.AccessDenied) as exc:
+                        # Couldn't kill (perm denied, race, etc.) — fall back
+                        # to the user-managed abort path.
+                        blocking_live_pid = pid
+                except (_psu.NoSuchProcess, _psu.AccessDenied):
+                    continue
+            # If we killed any leftovers, give the OS a moment to release
+            # file handles (esp. the lock file in <install>/terminal.cnf).
+            if killed_pids:
+                logging.info("[backtest] auto-killed leftover replica MT5 pid(s) %s; "
+                             "proceeding with new spawn", killed_pids)
+                time.sleep(1.5)
+            # Couldn't auto-clean — abort with the existing user-guided path.
+            if blocking_live_pid is not None:
+                _record_preflight_failure(ea, symbol, period, from_date, to_date,
+                                           deposit, leverage, currency,
+                                           "backtest_install_dir_locked",
+                                           f"安装目录已被 pid {blocking_live_pid} 的 MT5 占用（无法自动清理）")
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False,
+                    "error_code": "backtest_install_dir_locked",
+                    "error": (f"安装目录 {install_dir} 已经有一个 MT5 实例在跑"
+                              f" (pid {blocking_live_pid})，但权限不足无法自动清理。"),
+                    "diagnostic": {
+                        "running_pid": blocking_live_pid,
+                        "install_dir": install_dir,
+                    },
+                    "next_steps": [
+                        f"在任务管理器手动结束 pid {blocking_live_pid} 那个 MT5 进程",
+                        "然后重新发起回测请求",
+                        "如果反复出现，把 EasyDeal 以管理员身份运行可避免",
+                    ],
+                }, ensure_ascii=False))]
+        except ImportError:
+            pass  # psutil missing — skip the check, fall through to spawn
+
+    # Generate ID, INI, paths
+    bt_id = f"bt_{int(time.time() * 1000):x}"
+    report_name = f"easydeal-test-{bt_id}"
+    ini_path = os.path.join(install_dir, "Config", f"easydeal-test-{bt_id}.ini")
+
+    ini_content = _build_tester_ini(
+        ea=ea, symbol=symbol, period=period,
+        from_date=from_date, to_date=to_date,
+        deposit=deposit, leverage=leverage, currency=currency,
+        overrides=overrides, report_name=report_name,
+        login=acct_login, server=acct_server,
+    )
+    try:
+        _write_ini(ini_path, ini_content)
+    except Exception as exc:
+        return [TextContent(type="text", text=json.dumps(
+            {"ok": False, "error": f"写入 INI 失败：{exc}"}, ensure_ascii=False))]
+
+    # Report location — MT5 build 5xxx behaviour (empirically observed):
+    # when the INI's `Report=name` field has NO directory component, MT5
+    # writes the .htm directly into the *data dir root*, NOT into a
+    # `Reports/` subdir. Older builds / docs reference `Reports/` so we
+    # still check there as a fallback.
+    #
+    # In /portable mode, data_dir = install_dir (because of /portable),
+    # so reports land in <install_dir>/<name>.htm.
+    # In attached mode, they land in <data_dir>/<name>.htm.
+    report_candidates = []
+    # Roots that could hold the report file. Order = check first wins.
+    report_roots = []
+    if use_portable:
+        report_roots = [install_dir]
+    else:
+        if data_dir: report_roots.append(data_dir)
+        report_roots.append(install_dir)
+    # Side-companion: the .htm comes with -hst.png / -mfemae.png / -holding.png
+    # / .png siblings written to the same dir, so this dir is the truth.
+    for root in report_roots:
+        report_candidates.append(os.path.join(root, f"{report_name}.htm"))
+        report_candidates.append(os.path.join(root, f"{report_name}.html"))
+        # Legacy <root>/Reports/ subdir fallback (older builds, docs)
+        report_candidates.append(os.path.join(root, "Reports", f"{report_name}.htm"))
+        report_candidates.append(os.path.join(root, "Reports", f"{report_name}.html"))
+
+    # In portable mode add the /portable flag so the spawned tester uses
+    # install_dir as its data dir (with our pre-saved origin.dat for auto-login).
+    #
+    # IMPORTANT — manual quoting: when ini_path contains spaces (e.g.
+    # "D:\Projects\easy_deal_agent\MetaTrader 5 EXNESS_backtest\Config\..."),
+    # subprocess.list2cmdline wraps the whole "/config:path with space" arg
+    # in double-quotes:    "/config:D:\...\file.ini"
+    # but MT5 expects:     /config:"D:\...\file.ini"
+    # When MT5 sees the former, it treats the quoted string AS the path
+    # (including the leading "/config:") and silently fails:
+    #     `cannot load config "...\file.ini""`
+    # We bypass list2cmdline by building the command line ourselves and
+    # passing it as a string. Popen on Windows then hands it directly to
+    # CreateProcess unmodified.
+    def _winq(s):
+        return '"' + str(s).replace('"', '\\"') + '"' if (' ' in str(s) or '\t' in str(s)) else str(s)
+    cmd_parts = [_winq(terminal_exe)]
+    if use_portable:
+        cmd_parts.append("/portable")
+    # /profile: forces MT5 to load a SPECIFIC profile by name — if the named
+    # profile doesn't exist, MT5 creates an empty one. We use a dedicated
+    # name so the tester always boots into a CLEAN, EA-free workspace,
+    # regardless of what chart-attached EAs happen to live in the replica's
+    # Profiles/ dir. Without this, copies / restored backups / users who
+    # point backtest_install_dir at an existing populated MT5 would see
+    # their live chart layout (including attached EAs) auto-load alongside
+    # the strategy tester. This is belt-and-suspenders on top of the copy
+    # exclusion — the copy step already skips Profiles/, but this protects
+    # against bypasses (manual config, restored backups, etc.).
+    cmd_parts.append("/profile:easydeal-tester")
+    cmd_parts.append("/config:" + _winq(ini_path))
+    cmd = " ".join(cmd_parts)
+    spawn_flags = (
+        (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        if os.name == "nt" else 0
+    )
+
+    bt_record = {
+        "ea": ea, "symbol": symbol, "period": period,
+        "from_date": from_date, "to_date": to_date,
+        "deposit": deposit, "leverage": leverage, "currency": currency,
+        # input_overrides — the EA parameters Claude / user passed to override
+        # the source defaults. Persisted so the user can see "this run used
+        # InpFirstLots=0.05 InpStep=1.2" etc. when reviewing history later.
+        # Empty {} = used source defaults.
+        "input_overrides": dict(overrides) if overrides else {},
+        # Report account (so history shows which broker/account the run
+        # actually went against — useful when user has multiple).
+        "account": {"login": acct_login, "server": acct_server},
+        "ini_path": ini_path,
+        "report_name": report_name,
+        "report_candidates": report_candidates,
+        "spawn_cmd": cmd,
+        "spawn_cwd": install_dir,
+        "spawn_creationflags": spawn_flags,
+        "viewed": False,
+    }
+
+    # If the spawn budget is full, queue this run instead of starting it.
+    # get_backtest_status will dequeue automatically as running tasks finish.
+    if _running_backtests_count() >= _MAX_CONCURRENT_BACKTESTS:
+        bt_record["status"] = "queued"
+        bt_record["queued_at"] = time.time()
+        _backtests[bt_id] = bt_record
+        _trim_backtests()
+        _save_persisted_backtests()
+        position = _queue_position(bt_id)
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True,
+            "data": {
+                "backtest_id": bt_id,
+                "status": "queued",
+                "queue_position": position,
+                "ea": ea, "symbol": symbol, "period": period,
+                "from_date": from_date, "to_date": to_date,
+                "message": (
+                    f"已有 {_running_backtests_count()} 个回测在跑，本次排在第 {position} 位等待。"
+                    "前面的跑完会自动接力，无需手工操作。继续轮询 get_backtest_status 即可。"
+                ),
+            },
+        }, ensure_ascii=False))]
+
+    # Otherwise spawn immediately
+    bt_record["queued_at"] = time.time()
+    _backtests[bt_id] = bt_record
+    if not _spawn_backtest_now(bt_id, bt_record):
+        _save_persisted_backtests()
+        return [TextContent(type="text", text=json.dumps(
+            {"ok": False, "error": f"启动 MT5 测试进程失败：{bt_record.get('error')}"},
+            ensure_ascii=False))]
+    _trim_backtests()
+    _save_persisted_backtests()
+
+    # Auto-register the polling task in scheduler.db. Removes the LLM from
+    # the loop — Claude was claiming "已设置自动检查任务" without actually
+    # calling schedule_task. Now the scheduler sidecar fires every minute,
+    # spawns a headless claude turn that calls get_backtest_status, and
+    # cancels itself on terminal status.
+    poll_ok, poll_info = _auto_schedule_backtest_poll(bt_id, ea, symbol)
+    if poll_ok:
+        logging.info("[backtest] %s: auto-scheduled poll task %s", bt_id, poll_info)
+    else:
+        logging.warning("[backtest] %s: auto-schedule failed: %s — Claude must "
+                        "manually call get_backtest_status", bt_id, poll_info)
+
+    mode_msg = (
+        f"使用 portable 模式（专用账号 {acct_login}@{acct_server}），跟主 MT5 互不干扰。"
+        if use_portable
+        else "使用主 MT5 账号 attached 模式。如主 MT5 同时在跑，新实例可能弹登录框需要手动点击。"
+    )
+    return [TextContent(type="text", text=json.dumps({
+        "ok": True,
+        "data": {
+            "backtest_id": bt_id,
+            "status": "running",
+            "mode": "portable" if use_portable else "attached",
+            "ea": ea, "symbol": symbol, "period": period,
+            "from_date": from_date, "to_date": to_date,
+            "ini_path": ini_path,
+            "expected_report": report_candidates[0],
+            "account": {"login": acct_login, "server": acct_server},
+            "auto_poll_task_id": poll_info if poll_ok else None,
+            "auto_poll_status": "scheduled" if poll_ok else f"failed: {poll_info}",
+            "message": (
+                "回测已启动。" + mode_msg + "\n"
+                "1 年 H1 数据通常 1-3 分钟，M5 数据可能 5-10 分钟。\n"
+                "请用 get_backtest_status 轮询，参数：{\"backtest_id\": \"" + bt_id + "\"}"
+            ),
+        },
+    }, ensure_ascii=False))]
+
+
+def _get_backtest_status_tool(args: dict) -> list[TextContent]:
+    _ensure_backtests_loaded()
+    bt_id = (args.get("backtest_id") or "").strip()
+    if not bt_id:
+        return [TextContent(type="text", text=json.dumps(
+            {"ok": False, "error": "backtest_id 必填"}, ensure_ascii=False))]
+    bt = _backtests.get(bt_id)
+    if not bt:
+        return [TextContent(type="text", text=json.dumps(
+            {"ok": False, "error": f"未找到回测 {bt_id}（可能已被回收）"},
+            ensure_ascii=False))]
+
+    # Status: queued — still waiting for a spawn slot. Try to promote
+    # something first in case capacity opened up since last call.
+    _schedule_pending_backtests()
+    if bt.get("status") == "queued":
+        position = _queue_position(bt_id)
+        wait_seconds = int(time.time() - (bt.get("queued_at") or time.time()))
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True,
+            "data": {
+                "backtest_id": bt_id,
+                "status": "queued",
+                "queue_position": position,
+                "wait_seconds": wait_seconds,
+                "ea": bt["ea"], "symbol": bt["symbol"], "period": bt["period"],
+                "message": f"排队中（前面还有 {position - 1} 个）— 前一个跑完会自动接力。",
+            },
+        }, ensure_ascii=False))]
+
+    proc = bt.get("proc")
+    elapsed = int(time.time() - bt.get("started_at", time.time()))
+
+    # Records loaded from backtests.json (across MCP-process restarts) have
+    # status="running" but no live `proc` handle — the spawn happened in a
+    # previous MCP child that's now dead. We can't poll() it, but we CAN
+    # finalise from disk evidence:
+    #   - Report .htm exists in candidates → tester finished cleanly,
+    #     just nobody updated the record. Parse + mark "ok".
+    #   - No report AND no terminal64.exe alive in install_dir → spawn
+    #     died without producing report. Mark "finished_no_report".
+    #   - No report BUT a terminal64.exe is alive in install_dir → still
+    #     genuinely running (in another process); just report "running".
+    if proc is None:
+        # Build candidate list — prefer persisted report_candidates, fall
+        # back to derivation from id + install dir for old records that
+        # were persisted before we started saving the candidates field.
+        candidates = list(bt.get("report_candidates") or [])
+        if not candidates:
+            report_name = f"easydeal-test-{bt_id}"
+            spawn_cwd = bt.get("spawn_cwd") or ""
+            override = os.getenv("EASYDEAL_BACKTEST_INSTALL_DIR") or ""
+            install_guesses = [d for d in (spawn_cwd, override) if d]
+            for root in install_guesses:
+                for ext in ("htm", "html"):
+                    candidates.append(os.path.join(root, f"{report_name}.{ext}"))
+                    candidates.append(os.path.join(root, "Reports", f"{report_name}.{ext}"))
+        report_path_disk = None
+        for cand in candidates:
+            try:
+                if os.path.isfile(cand):
+                    report_path_disk = cand
+                    break
+            except Exception:
+                continue
+        if report_path_disk:
+            html = _read_report(report_path_disk)
+            metrics = _parse_html_report(html) if html else {}
+            bt["status"] = "ok"
+            bt["finished_at"] = bt.get("finished_at") or os.path.getmtime(report_path_disk)
+            bt["exit_code"] = bt.get("exit_code") or 0
+            bt["metrics"] = metrics
+            bt["report_path"] = report_path_disk
+            bt["error"] = None
+            _save_persisted_backtests()
+            _schedule_pending_backtests()
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "data": {
+                    "backtest_id": bt_id,
+                    "status": "ok",
+                    "elapsed_seconds": elapsed,
+                    "ea": bt.get("ea"), "symbol": bt.get("symbol"), "period": bt.get("period"),
+                    "from_date": bt.get("from_date"), "to_date": bt.get("to_date"),
+                    "report_path": report_path_disk,
+                    "metrics": metrics,
+                    "note": "记录从持久化文件恢复，没有活的 proc 句柄，但报告文件已存在 — 自动 finalise。",
+                },
+            }, ensure_ascii=False))]
+        # No report — check if any MT5 is still running in the install dir
+        # (= the spawn from prior MCP process is still alive somewhere)
+        install_dir = bt.get("spawn_cwd") or ""
+        external_alive = False
+        try:
+            import psutil as _psu  # type: ignore
+            if install_dir:
+                inst_norm = os.path.normcase(os.path.abspath(install_dir))
+                for p in _psu.process_iter(["name", "exe"]):
+                    try:
+                        n = (p.info.get("name") or "").lower()
+                        if n not in ("terminal64.exe", "terminal.exe"):
+                            continue
+                        ed = os.path.dirname(p.info.get("exe") or "")
+                        if os.path.normcase(os.path.abspath(ed)) == inst_norm:
+                            external_alive = True
+                            break
+                    except (_psu.NoSuchProcess, _psu.AccessDenied):
+                        continue
+        except ImportError:
+            pass
+        if external_alive:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "data": {
+                    "backtest_id": bt_id,
+                    "status": "running",
+                    "elapsed_seconds": elapsed,
+                    "ea": bt.get("ea"), "symbol": bt.get("symbol"), "period": bt.get("period"),
+                    "note": "上次 spawn 还在跑（不在本 MCP 进程里），稍后再轮询。",
+                },
+            }, ensure_ascii=False))]
+        # 0.3.0: Path A 的 race 兜底 —— 即使没 live proc 也没 external 进程，
+        # 也要看看是不是 MT5 退出后刚好在 flush .htm 的窗口里。检查
+        # install_dir 下任何 tester / terminal log 的最新 mtime，如果最近
+        # 60s 内还在写 → 给 grace。
+        try:
+            recent_log_activity = False
+            for sub in (["Tester", "logs"], ["Tester", "Logs"], ["Logs"]):
+                d = os.path.join(install_dir, *sub)
+                if not os.path.isdir(d):
+                    continue
+                for fn in os.listdir(d):
+                    if not fn.endswith(".log"):
+                        continue
+                    fp = os.path.join(d, fn)
+                    try:
+                        if (time.time() - os.path.getmtime(fp)) < 60:
+                            recent_log_activity = True
+                            break
+                    except Exception:
+                        continue
+                if recent_log_activity:
+                    break
+            if recent_log_activity:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": True,
+                    "data": {
+                        "backtest_id": bt_id,
+                        "status": "running",
+                        "elapsed_seconds": elapsed,
+                        "ea": bt.get("ea"), "symbol": bt.get("symbol"), "period": bt.get("period"),
+                        "note": (
+                            "原 MCP 子进程已死，但 install_dir 下 MT5 日志最近 60s 内还在写"
+                            " —— tester 退出但 .htm 还在 flush，先返 running 等下次 cron。"
+                        ),
+                    },
+                }, ensure_ascii=False))]
+        except Exception:
+            pass
+        # No proc, no report, no external MT5 alive → it's dead and lost.
+        # 试着从 install_dir 下的 tester / terminal log 里挖出真原因，比
+        # "spawn 死了" 这种泛泛说更有用。
+        postmortem = _collect_backtest_postmortem(install_dir, bt.get("started_at") or 0)
+        bt["status"] = "finished_no_report"
+        bt["finished_at"] = bt.get("finished_at") or time.time()
+        bt_error_msg = postmortem.get("hint") or "spawn 已退出但没生成报告（也没在 MT5 日志里抓到具体错因）"
+        bt["error"] = bt.get("error") or bt_error_msg
+        _save_persisted_backtests()
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True,
+            "data": {
+                "backtest_id": bt_id,
+                "status": "finished_no_report",
+                "elapsed_seconds": elapsed,
+                "ea": bt.get("ea"), "symbol": bt.get("symbol"), "period": bt.get("period"),
+                "error_code": "backtest_no_report",
+                "message": (
+                    f"回测失败：{bt_error_msg}。详见 log_lines / next_steps。"
+                ),
+                "diagnostic": {
+                    "install_dir": install_dir,
+                    "log_files_checked": postmortem.get("log_files_checked") or [],
+                    "log_lines":         postmortem.get("log_lines") or [],
+                    "note": "从持久化文件恢复，原 MCP 子进程已死；以上 log_lines 是从 install_dir 下的 MT5 日志里抓的、spawn 启动后写的相关行。",
+                },
+                "next_steps": _backtest_next_steps_from_hint(postmortem.get("hint")),
+            },
+        }, ensure_ascii=False))]
+
+    rc = proc.poll()
+
+    if rc is None:
+        # WATCHDOG — tester finished but MT5 didn't auto-shutdown.
+        #
+        # ShutdownTerminal=1 in the INI tells MT5 to quit after the tester
+        # completes; works most of the time but can be skipped (visual mode,
+        # race condition during cleanup, account auth dialog popping up
+        # AFTER tester finished, etc.). Symptoms: report .htm exists but
+        # process is still alive, holding the data-dir lock and blocking
+        # the next backtest.
+        #
+        # Detection: if any of the report_candidates file already exists
+        # AND it's not a stale leftover from a PREVIOUS backtest with the
+        # same id (which can't happen — id is uniquely time-based per run).
+        # If found → kill the process, treat it as if rc=0 (clean exit).
+        report_path_early = None
+        for cand in bt["report_candidates"]:
+            if os.path.isfile(cand):
+                report_path_early = cand
+                break
+        if report_path_early:
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass  # already dying or perm error; we'll fall through
+            rc = proc.poll() if proc.poll() is not None else 0
+            logging.info("[backtest] %s: tester report found but MT5 still alive — "
+                         "force-killed and finalised (likely ShutdownTerminal=1 "
+                         "skipped)", bt_id)
+            # Fall through to the "rc is set" branch below which finalises
+            # the record from the report.
+        else:
+            # Genuinely still running — soft-detect stuck states.
+            hint = None
+            if elapsed >= 30:
+                hint = (
+                    f"已经 {elapsed}s 了还没动静。如果你的主 MT5 在跑，"
+                    "新 spawn 的 tester 实例很可能弹了登录确认框等你点击——"
+                    "切到任务栏看看 MT5 是不是有未处理的对话框。点了登录之后 tester 会继续。"
+                )
+            elif elapsed >= 10 and _mt5_login_dialog_visible():
+                hint = "检测到 MT5 登录对话框可见，请去点击登录按钮（账号已预填）。"
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "data": {
+                    "backtest_id": bt_id,
+                    "status": "running",
+                    "elapsed_seconds": elapsed,
+                    "ea": bt["ea"], "symbol": bt["symbol"], "period": bt["period"],
+                    **({"user_action_hint": hint} if hint else {}),
+                },
+            }, ensure_ascii=False))]
+
+    # Process exited — find the report
+    report_path = None
+    for cand in bt["report_candidates"]:
+        if os.path.isfile(cand):
+            report_path = cand
+            break
+
+    if not report_path:
+        # 0.3.0: 防 race condition —— MT5 tester 进程退出后还要 ~5-30s 才把
+        # .htm 报告完全 flush 写盘。如果 cron 第一次 poll 正好抓在 process
+        # exited 但 file 还没 flush 的窗口里，会误报 finished_no_report，把
+        # 后面 cron 全 cancel，导致用户必须手动重问。
+        # 解决：第一次看到 proc 退出 + 没报告 → 标记 exit_observed_at，
+        # 返回 status="running_finalizing" 让 cron 再 poll 几次；超过 60s
+        # 还没 .htm 才真判失败。
+        now_ts = time.time()
+        first_observed = bt.get("exit_observed_at")
+        if not first_observed:
+            bt["exit_observed_at"] = now_ts
+            bt["exit_code_observed"] = rc
+            _save_persisted_backtests()
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "data": {
+                    "backtest_id": bt_id,
+                    "status": "running",
+                    "elapsed_seconds": elapsed,
+                    "ea": bt["ea"], "symbol": bt["symbol"], "period": bt["period"],
+                    "note": (
+                        f"MT5 进程刚退出（exit_code={rc}），但 .htm 报告还没 flush。"
+                        "MT5 tester 退出后通常 5-30s 才落盘，先等下次 cron 再 check。"
+                    ),
+                },
+            }, ensure_ascii=False))]
+        # 已经观察到 exit 不止一次了，给个总宽限期 60s
+        flush_grace_sec = 60
+        wait_secs = int(now_ts - first_observed)
+        if wait_secs < flush_grace_sec:
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "data": {
+                    "backtest_id": bt_id,
+                    "status": "running",
+                    "elapsed_seconds": elapsed,
+                    "ea": bt["ea"], "symbol": bt["symbol"], "period": bt["period"],
+                    "note": (
+                        f"MT5 进程已退出 {wait_secs}s（grace={flush_grace_sec}s），"
+                        ".htm 仍在 flush，再等下次 cron。"
+                    ),
+                },
+            }, ensure_ascii=False))]
+        # 超过 grace 还是没报告 → 真失败
+        # 抓 MT5 日志找具体错因 —— 比单纯 exit_code 信息量大得多
+        spawn_install = bt.get("spawn_cwd") or os.getenv("EASYDEAL_BACKTEST_INSTALL_DIR") or ""
+        postmortem = _collect_backtest_postmortem(spawn_install, bt.get("started_at") or 0)
+        bt["status"] = "finished_no_report"
+        bt["finished_at"] = time.time()
+        bt["exit_code"] = rc
+        bt["error"] = postmortem.get("hint") or "no report file produced"
+        _save_persisted_backtests()
+        _schedule_pending_backtests()
+
+        # Pattern-match the exit code to surface a precise next_steps list.
+        # The unsigned ↔ signed conversion: rc & 0xFFFFFFFF then check.
+        rc_signed = rc - (1 << 32) if rc >= (1 << 31) else rc
+        # 优先用从日志里挖到的 hint，没 hint 才走 exit_code 模式匹配，再没匹配就泛泛 fallback
+        if postmortem.get("hint"):
+            next_steps = _backtest_next_steps_from_hint(postmortem["hint"])
+        elif rc_signed == -1000012353:
+            # MT5's "tester not started because the account is not specified".
+            # Almost always means the spawn couldn't attach to a logged-in
+            # session — i.e., backtest portable bootstrap was never done.
+            next_steps = [
+                "客户端窗口 → 设置 tab → 回测环境 卡片",
+                "「回测 MT5 安装目录」留空（用主 MT5 那份即可，不论你日常用的是实盘还是模拟）",
+                "填回测账号 / 服务器（**用 demo 模拟账号**，回测就别动实盘资金了）",
+                "点「保存并启动登录（/portable）」按钮",
+                "弹出来的 MT5 里：文件 → 登录到交易账户 → 输账号密码 →",
+                "  勾「保存账户信息」→ 登录 → 关掉这个 MT5",
+                "下次回测自动用这套配置，不用再手动登录",
+            ]
+        else:
+            next_steps = _backtest_next_steps_from_hint(None)
+
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True,
+            "data": {
+                "backtest_id": bt_id,
+                "status": "finished_no_report",
+                "exit_code": rc,
+                "exit_code_signed": rc_signed,
+                "elapsed_seconds": elapsed,
+                "looked_in": bt["report_candidates"],
+                "error_code": "backtest_no_report",
+                "message": (
+                    f"MT5 测试进程已退出 (exit_code={rc}) 但未生成报告。"
+                    + (f"日志显示：{postmortem['hint']}" if postmortem.get("hint")
+                       else "MT5 日志里也没抓到明确错因，按 next_steps 排查。")
+                ),
+                "diagnostic": {
+                    "log_files_checked": postmortem.get("log_files_checked") or [],
+                    "log_lines":         postmortem.get("log_lines") or [],
+                },
+                "next_steps": next_steps,
+            },
+        }, ensure_ascii=False))]
+
+    html = _read_report(report_path)
+    if not html:
+        return [TextContent(type="text", text=json.dumps({
+            "ok": True,
+            "data": {
+                "backtest_id": bt_id,
+                "status": "report_unreadable",
+                "exit_code": rc,
+                "report_path": report_path,
+                "message": "找到报告文件但读不出来（编码问题），请手动打开 .htm",
+            },
+        }, ensure_ascii=False))]
+
+    metrics = _parse_html_report(html)
+    bt["status"] = "ok"
+    bt["finished_at"] = time.time()
+    bt["exit_code"] = rc
+    bt["metrics"] = metrics
+    bt["report_path"] = report_path
+    _save_persisted_backtests()
+    _schedule_pending_backtests()  # capacity freed — promote next queued
+
+    return [TextContent(type="text", text=json.dumps({
+        "ok": True,
+        "data": {
+            "backtest_id": bt_id,
+            "status": "ok",
+            "exit_code": rc,
+            "elapsed_seconds": elapsed,
+            "ea": bt["ea"], "symbol": bt["symbol"], "period": bt["period"],
+            "from_date": bt["from_date"], "to_date": bt["to_date"],
+            "report_path": report_path,
+            "metrics": metrics,
+        },
+    }, ensure_ascii=False))]
+
+
+def _list_backtests_tool(args: dict | None = None) -> list[TextContent]:
+    _ensure_backtests_loaded()
+    args = args or {}
+    limit = max(1, min(int(args.get("limit", 20)), 100))
+    ea_filter = (args.get("ea") or "").strip().lower()
+
+    items = []
+    for bt_id, bt in _backtests.items():
+        if ea_filter and (bt.get("ea") or "").lower() != ea_filter:
+            continue
+        proc = bt.get("proc")
+        rc = proc.poll() if proc else None
+        # If we have a live proc, that wins. Otherwise honour the persisted status.
+        live_status = bt.get("status") if (rc is not None or proc is None) else "running"
+        items.append({
+            "backtest_id": bt_id,
+            "ea": bt.get("ea"), "symbol": bt.get("symbol"), "period": bt.get("period"),
+            "from_date": bt.get("from_date"), "to_date": bt.get("to_date"),
+            "started_at": int(bt.get("started_at", 0)),
+            "finished_at": int(bt.get("finished_at") or 0) or None,
+            "elapsed_seconds": int(
+                (bt.get("finished_at") or time.time()) - bt.get("started_at", time.time())
+            ),
+            "exit_code": bt.get("exit_code") if rc is None else rc,
+            "status": live_status,
+            # Headline metrics so Claude doesn't need a follow-up call per id
+            "net_profit": (bt.get("metrics") or {}).get("net_profit"),
+            "sharpe":     (bt.get("metrics") or {}).get("sharpe"),
+            "trades":     (bt.get("metrics") or {}).get("trades"),
+            "max_drawdown_pct": (bt.get("metrics") or {}).get("max_drawdown_pct"),
+            "report_path": bt.get("report_path"),
+            "error":       bt.get("error"),
+        })
+    items.sort(key=lambda x: x["started_at"], reverse=True)
+    total = len(items)
+    items = items[:limit]
+    return [TextContent(type="text", text=json.dumps(
+        {"ok": True, "data": {
+            "backtests": items, "count": len(items), "total_in_history": total,
+            "note": (f"返回最近 {len(items)} 条；总共有 {total} 条历史记录。"
+                     "传 limit / ea 参数过滤。") if total > len(items) else None,
+        }},
+        ensure_ascii=False))]
 
 
 # ============== Main ==============
