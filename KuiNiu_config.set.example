@@ -1,0 +1,22 @@
+# 复制到 MT5 数据目录: Terminal/Common/Files/KuiNiu_config.set
+# 修改后约 3 秒自动热更新（需 Enable_Runtime_Config=true）
+
+KN_IsPaused=false
+Enable_DuShe_Grid=true
+Enable_NiuGui_Squad=false
+Enable_QingLong_Squad=true
+Risk_Warn_Account_Drawdown_Pct=8.0
+Risk_Freeze_Account_Drawdown_Pct=12.0
+Risk_Max_Account_Drawdown_Pct=18.0
+Risk_Daily_Loss_Limit_Pct=5.0
+Grid_Safe_Max_Levels=6
+Enable_Rescue_Engine=true
+Rescue_Target_Max_Levels=3
+Enable_Protective_Hedge=true
+News_Filter_Enabled=true
+News_Before_Minutes=30
+News_After_Minutes=30
+News_Block_New_Opens=true
+News_Freeze_When_Calendar_Unavailable=false
+Qinglong_TP_Activate_Money=8.0
+Qinglong_TP_Drawback_Ratio=0.25
