@@ -21,13 +21,13 @@
 //|   + 自适应追单上限 (Q6 决策)                                      |
 //|   + GATE-A 检查点: P4 后决定是否启动 ML (P4.5)                    |
 //|                                                                  |
-//|  当前阶段: P0/P1 — 重塑 + 点差护甲 + BE 补偿                      |
+//|  当前阶段: P5/P6 — 路由引擎完善 + 出场 Profile + 自适应追单          |
 //|  基线: V9.mq5 (夔牛 V9.1 News-Aware)                              |
 //+------------------------------------------------------------------+
 #property copyright "Zeus EA V10 — State-Routed Architecture"
-#property version   "10.00"
-#property description "宙斯 V10: 状态路由架构 + 点差护甲 + 品种自适应"
-#property description "详见 宙斯_开发文档.md (设计规格定稿 v0.4)"
+#property version   "10.02"
+#property description "宙斯 V10: 状态路由 + 出场Profile + 自适应追单"
+#property description "详见 宙斯_开发文档.md v0.9"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -64,7 +64,8 @@ CSymbolInfo   symInfo;
 input group "=== [A] 总开关与归属 ==="
 input long   InpMagic              = 20260522;   // EA 魔术号 (区分本 EA 持仓)
 input string InpComment            = "ZEUS_V10"; // 订单注释前缀 (V10 重塑)
-input bool   InpEnableGrid         = false;      // HC-08: 黄金高点差默认关网格
+input bool   InpEnableGrid         = false;      // 网格强制常开 (true=忽略Q4条件, 路由为GRID时即允许)
+input bool   InpGrid_HardDisable   = false;      // 网格硬禁用 (true=永不网格, 优先级最高)
 input bool   InpEnableBreakout     = true;       // 启用趋势突破引擎
 input int    InpSlippagePoints     = 50;         // 市价滑点 (点) | OnInit 按品种自适应
 
@@ -138,6 +139,11 @@ input double InpH1_MinADX          = 20.0;       // H1 ADX 阈值 (仅诊断)
 input int    InpH1_ADX_Period      = 14;         // H1 ADX 周期
 
 input group "=== [E] 网格引擎 (震荡态) - V8.1 安全化重构 ==="
+// Q4 决策: 默认不强制常开 (InpEnableGrid=false), 满足三重条件时运行时自动允许网格
+input bool   InpGrid_AutoEnable    = true;       // Q4: 震荡+低点差+H1弱 时自动允许网格
+input double InpGrid_AutoSpreadATR = 0.25;       // Q4/HC-08: S07/S09 spread/ATR 上限
+input double InpGrid_AutoSpreadATR_Narrow = 0.20;// Q4: S08 窄幅震荡更严 spread/ATR 上限
+input double InpGrid_AutoH1_ADXMax   = 20.0;     // Q4: H1 ADX 须低于此值 (大趋势酝酿则冻结)
 input double InpGrid_SpacingATR    = 0.5;        // 网格层间距 = ATR × 此值
 input int    InpGrid_MaxLevels     = 4;          // 单方向最大网格层数 (降为4层防爆)
 input double InpGrid_LotMultiplier = 1.0;        // 网格手数倍率 (1.0=等手数, 强烈建议不要>1.1)
@@ -161,7 +167,25 @@ input group "=== [F2] 突破引擎 - 模式 B: 趋势跟随 (V9 双模式入场)
 input bool   InpBO_EnableTrendFollow = true;     // 启用趋势跟随入场
 input double InpBO_TF_MinADX       = 28.0;       // ADX 达此值才认为趋势强 (V9: 30→28 放宽)
 input double InpBO_TF_PullbackATR  = 1.5;        // 回调窗口 = ATR × 此值 (V9 改回 0.5→1.5)
-input double InpBO_TF_MaxChaseATR  = 5.0;        // ★ V9 新增: 追单最大距离 = ATR × 此值
+input double InpBO_TF_MaxChaseATR  = 5.0;        // ★ V9 新增: 追单最大距离 = ATR × 此值 (Q6 自适应时作基线)
+
+input group "=== [F2b] 自适应追单上限 (V10 Q6) ==="
+input bool   InpAdaptiveMaxChase     = true;       // 启用自适应 MaxChase (§12.2)
+input int    InpAdaptiveLookbackWeeks  = 20;       // 回看周数 (M15 ATR 序列)
+input double InpBO_TF_BaseChase        = 5.0;      // 自适应基线/数据不足兜底
+input double InpMaxChase_Lower         = 2.0;      // 自适应下限 (ATR 倍数)
+input double InpMaxChase_Upper         = 8.0;      // 自适应上限 (ATR 倍数)
+
+input group "=== [F2c] 出场 Profile (V10 P6, 按路由派发) ==="
+// Profile A: 强趋势 BREAKOUT — 继承 V9.1 激进锁利
+// Profile B: 弱趋势 TREND_FOLLOW — 更紧 BE/追踪
+// Profile C: 网格 — 整篮 TP, 单笔无 BE/追踪 (ManageGridBasket 负责)
+input double InpExitB_BE_TriggerATR  = 0.6;      // Profile B: BE 触发
+input double InpExitB_TrailStartATR    = 1.2;      // Profile B: 追踪启动
+input double InpExitB_TrailDistATR     = 0.4;      // Profile B: 追踪距离
+input double InpExitB_TrailStepATR     = 0.15;     // Profile B: 追踪步长
+input double InpExitLight_LotMult      = 0.5;      // BREAKOUT_LIGHT 手数系数
+input double InpExitFollow_LotMult     = 0.6;      // TREND_FOLLOW 手数系数
 input ENUM_TIMEFRAMES InpBO_TF_AnchorTF = PERIOD_M5; // 趋势跟随锚点周期
 input int    InpBO_TF_AnchorMAPer  = 20;         // 锚点均线周期 (EMA)
 input int    InpBO_TF_CooldownSec  = 180;        // 趋势跟随入场冷却(秒)
@@ -248,6 +272,13 @@ enum StrategyRoute {
    // V10 P4 新增
    ROUTE_BREAKOUT_LIGHT = 5,  // 轻仓突破 (S02 爆发前夜, 0.5× 仓位)
    ROUTE_TREND_FOLLOW   = 6   // 仅趋势跟随 (S05/S06 弱趋势, 0.6× 仓位 + 紧追踪)
+};
+
+// V10 P6: 出场 Profile (按路由派发, 详见 §5.4)
+enum ExitProfile {
+   EXIT_PROFILE_A = 0,  // 激进锁利 (强趋势 / 轻仓突破)
+   EXIT_PROFILE_B = 1,  // 紧跟随 (弱趋势)
+   EXIT_PROFILE_C = 2   // 网格整篮 (单笔无 BE/追踪)
 };
 
 enum EngineType {
@@ -343,6 +374,13 @@ bool g_panelCollapsed    = false;
 // V10: 日盈利目标达成标记 (达成后 g_runPaused 同步置 true)
 bool g_dailyTargetHit    = false;
 datetime g_dailyTargetHitTime = 0;
+
+// V10 Q6: 自适应追单状态
+double   g_effectiveMaxChaseATR = 5.0;
+datetime g_maxChaseRefreshWeek  = 0;   // 上次刷新所在周的周一 00:00
+
+// V10 Q4: 网格三重激活 (运行时由 UpdateGridAutoAllowed_Zeus 刷新)
+bool g_gridAutoAllowed = false;
 
 // 诊断
 datetime g_lastDiagTime = 0;
@@ -1119,6 +1157,7 @@ void UpdateMarketRegime() {
       // V8.1 关键修复: 从震荡切到趋势/高波动时, 强平网格
       bool exitFromRange = (oldRegime == REGIME_RANGE);
       bool intoTrend = (newRegime == REGIME_TREND_UP || newRegime == REGIME_TREND_DOWN ||
+                         newRegime == REGIME_TREND_UP_WK || newRegime == REGIME_TREND_DN_WK ||
                          newRegime == REGIME_HIGH_VOL);
       if(InpGrid_CloseOnTrendSwitch && exitFromRange && intoTrend) {
          int gridCount = CountOurPositions(-1, ENG_GRID);
@@ -1271,6 +1310,196 @@ string RouteText(StrategyRoute r) {
 }
 
 //+------------------------------------------------------------------+
+//| V10 P5/P6/Q6: 路由 → 手数系数 / 出场 Profile / 自适应追单        |
+//+------------------------------------------------------------------+
+string ExitProfileText(ExitProfile p) {
+   switch(p) {
+      case EXIT_PROFILE_A: return "A (激进锁利)";
+      case EXIT_PROFILE_B: return "B (紧跟随)";
+      case EXIT_PROFILE_C: return "C (网格篮)";
+      default:             return "?";
+   }
+}
+
+ExitProfile GetExitProfileForRoute(StrategyRoute route) {
+   switch(route) {
+      case ROUTE_BREAKOUT:
+      case ROUTE_BREAKOUT_LIGHT:
+         return EXIT_PROFILE_A;
+      case ROUTE_TREND_FOLLOW:
+         return EXIT_PROFILE_B;
+      case ROUTE_GRID_NARROW:
+      case ROUTE_GRID_WIDE:
+         return EXIT_PROFILE_C;
+      default:
+         return EXIT_PROFILE_A;  // 存量单默认 A
+   }
+}
+
+double GetRouteLotMult() {
+   switch(g_currentRoute) {
+      case ROUTE_BREAKOUT_LIGHT: return InpExitLight_LotMult;
+      case ROUTE_TREND_FOLLOW:   return InpExitFollow_LotMult;
+      default:                   return 1.0;
+   }
+}
+
+bool IsRegimeBullish(MarketRegime r) {
+   if(r == REGIME_TREND_UP || r == REGIME_TREND_UP_WK) return true;
+   if(r == REGIME_PRE_BREAKOUT) return (GetADX_Direction(0) > 0);
+   return false;
+}
+
+bool IsRegimeBearish(MarketRegime r) {
+   if(r == REGIME_TREND_DOWN || r == REGIME_TREND_DN_WK) return true;
+   if(r == REGIME_PRE_BREAKOUT) return (GetADX_Direction(0) < 0);
+   return false;
+}
+
+// 取当前有效追单上限 (ATR 倍数)
+double GetEffectiveMaxChaseATR() {
+   if(!InpAdaptiveMaxChase) return InpBO_TF_MaxChaseATR;
+   return g_effectiveMaxChaseATR;
+}
+
+// Q6: 每周一刷新自适应 MaxChase (§12.2)
+void RefreshAdaptiveMaxChase_Zeus() {
+   if(!InpAdaptiveMaxChase) {
+      g_effectiveMaxChaseATR = InpBO_TF_MaxChaseATR;
+      return;
+   }
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int dow = dt.day_of_week;  // 0=周日
+   datetime weekStart = TimeCurrent() - (dow == 0 ? 6 : dow - 1) * 86400;
+   weekStart -= (weekStart % 86400);
+   if(g_maxChaseRefreshWeek == weekStart) return;
+
+   double oldVal = g_effectiveMaxChaseATR;
+   double atrNow = GetATR(g_hATR, 0);
+   if(atrNow <= 0) {
+      g_effectiveMaxChaseATR = InpBO_TF_BaseChase;
+      g_maxChaseRefreshWeek = weekStart;
+      return;
+   }
+
+   int barsPerWeek = 96 * 5;  // M15 约 5 个交易日
+   int needBars = MathMin(barsPerWeek * InpAdaptiveLookbackWeeks, 5000);
+   double atrBuf[];
+   ArraySetAsSeries(atrBuf, true);
+   int copied = CopyBuffer(g_hATR, 0, 1, needBars, atrBuf);
+   if(copied < barsPerWeek) {
+      g_effectiveMaxChaseATR = InpBO_TF_BaseChase;
+      PrintFormat("⚠ [Q6 REG-07] ATR 数据不足 (%d 根) → 退回基线 %.2f",
+                  copied, InpBO_TF_BaseChase);
+      g_maxChaseRefreshWeek = weekStart;
+      return;
+   }
+
+   double sorted[];
+   ArrayResize(sorted, copied);
+   ArrayCopy(sorted, atrBuf, 0, 0, copied);
+   ArraySort(sorted);
+   int idx80 = (int)MathFloor(copied * 0.80);
+   if(idx80 >= copied) idx80 = copied - 1;
+   double p80 = sorted[idx80];
+   double raw = (p80 / atrNow) * InpBO_TF_BaseChase;
+   g_effectiveMaxChaseATR = MathMax(InpMaxChase_Lower, MathMin(InpMaxChase_Upper, raw));
+   g_maxChaseRefreshWeek = weekStart;
+
+   PrintFormat("📐 [Q6] 自适应 MaxChase 刷新: %.2f → %.2f ATR (p80=%.5f cur=%.5f 样本=%d)",
+               oldVal, g_effectiveMaxChaseATR, p80, atrNow, copied);
+}
+
+// P6: 按 Profile 取 BE/追踪参数 (输出到引用参数)
+void GetExitParamsForProfile(ExitProfile prof,
+                             double &beTrig, double &trailStart,
+                             double &trailDist, double &trailStep,
+                             bool &useDynBE) {
+   switch(prof) {
+      case EXIT_PROFILE_B:
+         beTrig      = InpExitB_BE_TriggerATR;
+         trailStart  = InpExitB_TrailStartATR;
+         trailDist   = InpExitB_TrailDistATR;
+         trailStep   = InpExitB_TrailStepATR;
+         useDynBE    = true;
+         break;
+      case EXIT_PROFILE_A:
+      default:
+         beTrig      = InpBO_BE_TriggerATR;
+         trailStart  = InpBO_TrailStartATR;
+         trailDist   = InpBO_TrailDistATR;
+         trailStep   = InpBO_TrailStepATR;
+         useDynBE    = InpBO_BE_DynamicByATR;
+         break;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| V10 Q4: 网格三重激活 + 引擎许可 (文档 §6.3 / §12 Q4)              |
+//+------------------------------------------------------------------+
+void UpdateGridAutoAllowed_Zeus() {
+   g_gridAutoAllowed = false;
+   if(!InpGrid_AutoEnable) return;
+   if(InpGrid_HardDisable) return;
+
+   bool rangeState = (g_regime == REGIME_RANGE || g_regime == REGIME_RANGE_WIDE ||
+                      g_regime == REGIME_RANGE_NARROW);
+   if(!rangeState) return;
+
+   double sATR = GetSpreadATRRatio_Zeus();
+   double spreadCap = (g_regime == REGIME_RANGE_NARROW)
+                      ? InpGrid_AutoSpreadATR_Narrow
+                      : InpGrid_AutoSpreadATR;
+   if(sATR <= 0 || sATR > spreadCap) return;
+
+   if(InpEnableH1Bias && g_h1AdxVal >= InpGrid_AutoH1_ADXMax) return;
+
+   g_gridAutoAllowed = true;
+}
+
+bool IsGridEnginePermitted() {
+   if(InpGrid_HardDisable) return false;
+   if(!g_runEnableGrid) return false;
+   if(InpEnableGrid) return true;
+   if(InpGrid_AutoEnable && g_gridAutoAllowed) return true;
+   return false;
+}
+
+string GridPermitStatusText() {
+   if(InpGrid_HardDisable) return "硬禁用";
+   if(!g_runEnableGrid) return "面板 OFF";
+   if(InpEnableGrid) return "强制常开";
+   if(g_gridAutoAllowed) return "Q4 自动 ON";
+   if(!InpGrid_AutoEnable) return "自动未启用";
+   double sATR = GetSpreadATRRatio_Zeus();
+   double cap = (g_regime == REGIME_RANGE_NARROW)
+                ? InpGrid_AutoSpreadATR_Narrow : InpGrid_AutoSpreadATR;
+   if(sATR > cap)
+      return StringFormat("等待 spread/ATR≤%.2f (现 %.2f)", cap, sATR);
+   if(InpEnableH1Bias && g_h1AdxVal >= InpGrid_AutoH1_ADXMax)
+      return StringFormat("等待 H1_ADX<%.1f (现 %.1f)", InpGrid_AutoH1_ADXMax, g_h1AdxVal);
+   bool rangeState = (g_regime == REGIME_RANGE || g_regime == REGIME_RANGE_WIDE ||
+                      g_regime == REGIME_RANGE_NARROW);
+   if(!rangeState)
+      return StringFormat("等待震荡态 (现 %s)", RegimeText(g_regime));
+   return "等待 Q4 条件";
+}
+
+string GridFreezeReason_Zeus(double spreadATR) {
+   if(InpGrid_HardDisable) return "网格硬禁用";
+   if(!g_runEnableGrid) return "面板网格 OFF";
+   if(IsGridEnginePermitted()) return "";
+   double cap = (g_regime == REGIME_RANGE_NARROW)
+                ? InpGrid_AutoSpreadATR_Narrow : InpGrid_AutoSpreadATR;
+   if(spreadATR > cap)
+      return StringFormat("spread_ATR=%.2f > %.2f (HC-08)", spreadATR, cap);
+   if(InpEnableH1Bias && g_h1AdxVal >= InpGrid_AutoH1_ADXMax)
+      return StringFormat("H1_ADX=%.1f ≥ %.1f (大趋势酝酿)", g_h1AdxVal, InpGrid_AutoH1_ADXMax);
+   return StringFormat("Q4 未满足 (%s)", GridPermitStatusText());
+}
+
+//+------------------------------------------------------------------+
 //| V10 P3: 策略路由表 — 核心函数                                     |
 //|                                                                  |
 //| 输入: 当前状态 g_regime + 全局上下文                              |
@@ -1348,47 +1577,31 @@ StrategyRoute ResolveRoute_Zeus(string &routeReason) {
       // P4: 窄幅震荡 → 高点差时 FREEZE, 低点差可窄网格
       case REGIME_RANGE_NARROW: {
          double sATR = GetSpreadATRRatio_Zeus();
-         if(sATR > 0.20 || !g_runEnableGrid) {
-            routeReason = StringFormat("S08 窄幅 spread_ATR=%.2f → FREEZE", sATR);
+         if(!IsGridEnginePermitted()) {
+            routeReason = StringFormat("S08 窄幅 | %s", GridFreezeReason_Zeus(sATR));
             return ROUTE_FREEZE;
          }
-         routeReason = StringFormat("S08 窄幅震荡 (spread_ATR=%.2f) → GRID_NARROW", sATR);
+         routeReason = StringFormat("S08 窄幅震荡 (spread_ATR=%.2f, Q4自动)", sATR);
          return ROUTE_GRID_NARROW;
       }
 
       case REGIME_RANGE_WIDE: {
          double sATR = GetSpreadATRRatio_Zeus();
-         if(sATR > 0.25) {
-            routeReason = StringFormat("S07 宽幅震荡但 spread_ATR=%.2f > 0.25 → FREEZE (HC-08)", sATR);
+         if(!IsGridEnginePermitted()) {
+            routeReason = StringFormat("S07 宽幅 | %s", GridFreezeReason_Zeus(sATR));
             return ROUTE_FREEZE;
          }
-         if(!g_runEnableGrid) {
-            routeReason = "S07 宽幅震荡但用户关闭网格 → FREEZE";
-            return ROUTE_FREEZE;
-         }
-         if(g_h1AdxVal >= 25.0) {
-            routeReason = StringFormat("S07 但 H1_ADX=%.1f ≥25 (大趋势酝酿) → FREEZE", g_h1AdxVal);
-            return ROUTE_FREEZE;
-         }
-         routeReason = StringFormat("S07 宽幅震荡 (spread_ATR=%.2f)", sATR);
+         routeReason = StringFormat("S07 宽幅震荡 (spread_ATR=%.2f, Q4自动)", sATR);
          return ROUTE_GRID_WIDE;
       }
 
       case REGIME_RANGE: {
          double sATR = GetSpreadATRRatio_Zeus();
-         if(sATR > 0.25) {
-            routeReason = StringFormat("S09 盘整但 spread_ATR=%.2f > 0.25 → FREEZE (HC-08)", sATR);
+         if(!IsGridEnginePermitted()) {
+            routeReason = StringFormat("S09 盘整 | %s", GridFreezeReason_Zeus(sATR));
             return ROUTE_FREEZE;
          }
-         if(!g_runEnableGrid) {
-            routeReason = "S09 盘整但用户关闭网格 → FREEZE";
-            return ROUTE_FREEZE;
-         }
-         if(g_h1AdxVal >= 25.0) {
-            routeReason = StringFormat("S09 但 H1_ADX=%.1f ≥25 → FREEZE", g_h1AdxVal);
-            return ROUTE_FREEZE;
-         }
-         routeReason = StringFormat("S09 盘整 (spread_ATR=%.2f)", sATR);
+         routeReason = StringFormat("S09 盘整 (spread_ATR=%.2f, Q4自动)", sATR);
          return ROUTE_GRID_NARROW;
       }
 
@@ -1544,18 +1757,25 @@ string BuildDiagnosticReport() {
                             RegimeText(g_regime));
       }
    }
-   // V10 P3: 当前路由 + Donch_w
+   // V10 P3: 当前路由 + Donch_w + P6 出场 / 手数系数 / Q6 追单
    {
       double donchPct = GetDonchianWidthPct();
-      s += StringFormat("【路由】%s\n", RouteText(g_currentRoute));
+      ExitProfile ep = GetExitProfileForRoute(g_currentRoute);
+      s += StringFormat("【路由】%s | 手数×%.2f | 出场 %s\n",
+                         RouteText(g_currentRoute), GetRouteLotMult(), ExitProfileText(ep));
       s += StringFormat("       └─ %s\n", g_currentRouteReason);
-      s += StringFormat("【Donch_w】%.2f%% (S07宽阈值≥%.2f%%)\n",
-                         donchPct, InpDonchWideThresholdPct);
+      s += StringFormat("【Donch_w】%.2f%% (宽≥%.2f%% 窄≤%.2f%%)\n",
+                         donchPct, InpDonchWideThresholdPct, InpDonchNarrowFloorPct);
+      if(InpAdaptiveMaxChase || g_currentRoute == ROUTE_TREND_FOLLOW)
+         s += StringFormat("【追单上限】MaxChase=%.2f ATR (%s)\n",
+                            GetEffectiveMaxChaseATR(),
+                            InpAdaptiveMaxChase ? "auto" : "固定");
    }
 
-   s += StringFormat("【运行】Paused=%s Grid=%s BO=%s\n",
+   s += StringFormat("【运行】Paused=%s Grid=%s (%s) BO=%s\n",
                       g_runPaused ? "是" : "否",
-                      g_runEnableGrid ? "开" : "关",
+                      IsGridEnginePermitted() ? "允许" : "禁止",
+                      GridPermitStatusText(),
                       g_runEnableBreakout ? "开" : "关");
 
    string reason;
@@ -1581,7 +1801,9 @@ string BuildDiagnosticReport() {
    }
 
    // 趋势期入场配额 (V9: 默认放宽到 10)
-   if(g_regime == REGIME_TREND_UP || g_regime == REGIME_TREND_DOWN) {
+   if(g_regime == REGIME_TREND_UP || g_regime == REGIME_TREND_DOWN ||
+      g_regime == REGIME_TREND_UP_WK || g_regime == REGIME_TREND_DN_WK ||
+      g_regime == REGIME_PRE_BREAKOUT) {
       s += StringFormat("【趋势期】入场 %d/%d 笔 | 冷启动=%s\n",
                          g_entriesThisTrend, InpMaxEntriesPerTrend,
                          TrendCooldownOK() ? "已完成" : "进行中");
@@ -1636,8 +1858,9 @@ string BuildDiagnosticReport() {
                          SymbolInfoDouble(_Symbol, SYMBOL_ASK));
    }
 
-   // 突破引擎诊断
-   if(g_regime == REGIME_TREND_UP || g_regime == REGIME_TREND_DOWN) {
+   // 突破引擎诊断 (强/弱/前夜趋势)
+   if(IsRegimeBullish(g_regime) || IsRegimeBearish(g_regime) ||
+      g_regime == REGIME_TREND_UP_WK || g_regime == REGIME_TREND_DN_WK) {
       double atr = GetATR(g_hATR_Exec, 0);
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -1677,17 +1900,17 @@ string BuildDiagnosticReport() {
          if(CopyBuffer(g_hTF_MA, 0, 0, 1, maArr) >= 1) anchor = maArr[0];
          double adx = GetADX(0);
          double pullbackDist = atr * InpBO_TF_PullbackATR;
-         double maxChaseDist = atr * InpBO_TF_MaxChaseATR;
-         s += StringFormat("【趋势跟随】锚点EMA=%.5f ADX=%.1f (需≥%.1f) 回调≤%.5f 追单≤%.5f\n",
-                            anchor, adx, InpBO_TF_MinADX, pullbackDist, maxChaseDist);
-         if(g_regime == REGIME_TREND_UP) {
+         double maxChaseDist = atr * GetEffectiveMaxChaseATR();
+         s += StringFormat("【趋势跟随】锚点EMA=%.5f ADX=%.1f 回调≤%.5f 追单≤%.5f (MaxChase=%.2f ATR)\n",
+                            anchor, adx, pullbackDist, maxChaseDist, GetEffectiveMaxChaseATR());
+         if(IsRegimeBullish(g_regime)) {
             double diff = ask - anchor;
             bool inPullback = (anchor > 0 && diff >= 0 && diff <= pullbackDist);
             bool inChase    = (anchor > 0 && diff > pullbackDist && diff <= maxChaseDist);
             string status = inPullback ? "是[回调]" : (inChase ? "是[追单]" : "否");
             s += StringFormat("           多头入场? %s (Ask=%.5f 距锚点 %.5f)\n",
                                status, ask, diff);
-         } else if(g_regime == REGIME_TREND_DOWN) {
+         } else if(IsRegimeBearish(g_regime)) {
             double diff = anchor - bid;
             bool inPullback = (anchor > 0 && diff >= 0 && diff <= pullbackDist);
             bool inChase    = (anchor > 0 && diff > pullbackDist && diff <= maxChaseDist);
@@ -1697,10 +1920,18 @@ string BuildDiagnosticReport() {
          }
       }
    }
-   // 网格引擎诊断
-   if(g_regime == REGIME_RANGE) {
+   // 网格引擎诊断 (Q4 三重激活)
+   if(g_regime == REGIME_RANGE || g_regime == REGIME_RANGE_WIDE ||
+      g_regime == REGIME_RANGE_NARROW) {
       double atr = GetATR(g_hATR_Exec, 0);
-      s += StringFormat("【网格】ATR=%.5f 间距=%.5f 多/空 %d/%d (max %d)\n",
+      double sATR = GetSpreadATRRatio_Zeus();
+      double cap = (g_regime == REGIME_RANGE_NARROW)
+                   ? InpGrid_AutoSpreadATR_Narrow : InpGrid_AutoSpreadATR;
+      s += StringFormat("【网格】许可=%s | Auto=%s spread/ATR=%.2f/%.2f H1_ADX=%.1f/%.1f\n",
+                         IsGridEnginePermitted() ? "是" : "否",
+                         g_gridAutoAllowed ? "满足" : "未满足",
+                         sATR, cap, g_h1AdxVal, InpGrid_AutoH1_ADXMax);
+      s += StringFormat("       ATR=%.5f 间距=%.5f 多/空 %d/%d (max %d)\n",
                          atr, atr * InpGrid_SpacingATR,
                          CountOurPositions(0, ENG_GRID),
                          CountOurPositions(1, ENG_GRID),
@@ -1735,7 +1966,7 @@ void PrintDiagnostic(const bool force) {
 // 网格引擎 (震荡态)
 //==================================================================
 void ManageGridEngine() {
-   if(!g_runEnableGrid || !InpEnableGrid) return;
+   if(!IsGridEnginePermitted()) return;
    // V10 P3+P4: 兼容 S09 盘整 / S07 宽幅 / S08 窄幅震荡 (路由层已确保合规)
    if(g_regime != REGIME_RANGE && g_regime != REGIME_RANGE_WIDE &&
       g_regime != REGIME_RANGE_NARROW) return;
@@ -1882,23 +2113,42 @@ void CloseEngine(EngineType eng, const string reason) {
 }
 
 //==================================================================
-// 突破引擎 (趋势态)
+// 突破引擎 (V10 P5: 按路由分发)
 //==================================================================
 void ManageBreakoutEngine() {
    if(!g_runEnableBreakout || !InpEnableBreakout) return;
-   if(g_regime != REGIME_TREND_UP && g_regime != REGIME_TREND_DOWN) return;
+
+   bool allowDonchian    = false;
+   bool allowTrendFollow = false;
+
+   switch(g_currentRoute) {
+      case ROUTE_BREAKOUT:
+         if(g_regime != REGIME_TREND_UP && g_regime != REGIME_TREND_DOWN) return;
+         allowDonchian    = InpBO_EnableDonchian;
+         allowTrendFollow = InpBO_EnableTrendFollow;
+         break;
+      case ROUTE_BREAKOUT_LIGHT:
+         if(g_regime != REGIME_PRE_BREAKOUT) return;
+         allowDonchian    = InpBO_EnableDonchian;   // 前夜仅 Donchian 轻仓
+         allowTrendFollow = false;
+         break;
+      case ROUTE_TREND_FOLLOW:
+         if(g_regime != REGIME_TREND_UP_WK && g_regime != REGIME_TREND_DN_WK) return;
+         allowDonchian    = false;
+         allowTrendFollow = InpBO_EnableTrendFollow;
+         break;
+      default:
+         return;
+   }
 
    string reason;
    if(!CanOpenNew(reason)) { g_lastBlockReason = "突破被拒: " + reason; return; }
 
-   // V8.2: 趋势冷启动 (刚切入趋势态, 让市场再走 N 根 K 线确认稳定)
    if(!TrendCooldownOK()) {
       g_lastBlockReason = StringFormat("趋势冷启动中 (需等 %d 根 %s K线)",
-                                        InpTrendColdStartBars,
-                                        EnumToString(InpRegimeTF));
+                                        InpTrendColdStartBars, EnumToString(InpRegimeTF));
       return;
    }
-   // V8.2: 单趋势期入场次数配额
    if(!TrendEntryQuotaOK()) {
       g_lastBlockReason = StringFormat("本趋势期已入场 %d/%d 笔, 等下一段趋势",
                                         g_entriesThisTrend, InpMaxEntriesPerTrend);
@@ -1908,14 +2158,8 @@ void ManageBreakoutEngine() {
    double atr = GetATR(g_hATR_Exec, 0);
    if(atr <= 0) return;
 
-   // 模式 A: Donchian 突破
-   if(InpBO_EnableDonchian) {
-      TryDonchianBreakout(atr);
-   }
-   // 模式 B: 趋势跟随 (回调入场)
-   if(InpBO_EnableTrendFollow) {
-      TryTrendFollow(atr);
-   }
+   if(allowDonchian)    TryDonchianBreakout(atr);
+   if(allowTrendFollow) TryTrendFollow(atr);
 }
 
 //--- 模式 A: Donchian 突破入场
@@ -1940,7 +2184,7 @@ void TryDonchianBreakout(double atr) {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   if(g_regime == REGIME_TREND_UP && ask > hh) {
+   if(IsRegimeBullish(g_regime) && ask > hh) {
       if(!IsAlignedWithH1Bias(ORDER_TYPE_BUY)) {
          g_lastBlockReason = StringFormat("Donchian多头被H1过滤: 大趋势=%s", BiasText(g_h1Bias));
       } else if(CountOurPositions(0, ENG_BREAKOUT) < InpBO_MaxSameSide &&
@@ -1949,7 +2193,7 @@ void TryDonchianBreakout(double atr) {
          OpenBreakoutPosition(ORDER_TYPE_BUY, atr);
       }
    }
-   if(g_regime == REGIME_TREND_DOWN && bid < ll) {
+   if(IsRegimeBearish(g_regime) && bid < ll) {
       if(!IsAlignedWithH1Bias(ORDER_TYPE_SELL)) {
          g_lastBlockReason = StringFormat("Donchian空头被H1过滤: 大趋势=%s", BiasText(g_h1Bias));
       } else if(CountOurPositions(1, ENG_BREAKOUT) < InpBO_MaxSameSide &&
@@ -1974,7 +2218,8 @@ void TryDonchianBreakout(double atr) {
 void TryTrendFollow(double atr) {
    if(g_hTF_MA == INVALID_HANDLE) return;
    double adx = GetADX(0);
-   if(adx < InpBO_TF_MinADX) return;
+   double minAdx = (g_currentRoute == ROUTE_TREND_FOLLOW) ? InpADX_TrendMin : InpBO_TF_MinADX;
+   if(adx < minAdx) return;
 
    double ma[];
    ArraySetAsSeries(ma, true);
@@ -1984,11 +2229,10 @@ void TryTrendFollow(double atr) {
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double pullbackDist = atr * InpBO_TF_PullbackATR;    // 回调窗口
-   double maxChaseDist = atr * InpBO_TF_MaxChaseATR;    // 追单上限
+   double pullbackDist = atr * InpBO_TF_PullbackATR;
+   double maxChaseDist = atr * GetEffectiveMaxChaseATR();
 
-   // 多头趋势: 价格在锚点上方 且 距锚点 ≤ 追单上限
-   if(g_regime == REGIME_TREND_UP) {
+   if(IsRegimeBullish(g_regime)) {
       double diff = ask - anchor;
       // 方式 A: 回调入场 (价格在锚点正上方且接近)
       bool inPullback = (diff >= 0) && (diff <= pullbackDist);
@@ -2009,8 +2253,7 @@ void TryTrendFollow(double atr) {
          }
       }
    }
-   // 空头趋势: 价格在锚点下方 且 距锚点 ≤ 追单上限
-   if(g_regime == REGIME_TREND_DOWN) {
+   if(IsRegimeBearish(g_regime)) {
       double diff = anchor - bid;  // 正数表示 bid 在 anchor 下方
       bool inPullback = (diff >= 0) && (diff <= pullbackDist);
       bool inChase    = (diff > pullbackDist) && (diff <= maxChaseDist);
@@ -2038,7 +2281,10 @@ bool OpenBreakoutPositionTF(ENUM_ORDER_TYPE type, double atr) {
    double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                                             : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double slDist = MathAbs(price - slPrice);
-   double lots = CalcLotByRisk(slDist);
+   double lots = CalcLotByRisk(slDist) * GetRouteLotMult();
+   if(lots < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+      lots = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   lots = NormalizeLots(lots);
    int sameSide = CountOurPositions((type == ORDER_TYPE_BUY) ? 0 : 1, ENG_BREAKOUT);
    string cmt = StringFormat("%s_B_TF%d", InpComment, sameSide + 1);
    ulong tk = OpenMarketOrder(type, lots, slPrice, 0, cmt);
@@ -2053,7 +2299,10 @@ void OpenBreakoutPosition(ENUM_ORDER_TYPE type, double atr) {
    double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                                             : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double slDist = MathAbs(price - slPrice);
-   double lots = CalcLotByRisk(slDist);
+   double lots = CalcLotByRisk(slDist) * GetRouteLotMult();
+   if(lots < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+      lots = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   lots = NormalizeLots(lots);
 
    int sameSide = CountOurPositions((type == ORDER_TYPE_BUY) ? 0 : 1, ENG_BREAKOUT);
    string cmt = StringFormat("%s_B%d", InpComment, sameSide + 1);
@@ -2137,11 +2386,16 @@ bool ModifyPositionSL(ulong ticket, double newSL) {
    return true;
 }
 
-//--- 突破单分级动态止损: 保本 → ATR 追踪
+//--- 突破单分级动态止损: 保本 → ATR 追踪 (V10 P6 按路由 Profile)
 void ManageBreakoutTrailing() {
    SyncBOStates();
    double atr = GetATR(g_hATR_Exec, 0);
    if(atr <= 0) return;
+
+   ExitProfile prof = GetExitProfileForRoute(g_currentRoute);
+   double beTrig, trailStart, trailDist, trailStep;
+   bool useDynBE;
+   GetExitParamsForProfile(prof, beTrig, trailStart, trailDist, trailStep, useDynBE);
 
    for(int i = 0; i < ArraySize(g_boStates); i++) {
       ulong tk = g_boStates[i].ticket;
@@ -2151,44 +2405,39 @@ void ManageBreakoutTrailing() {
       double curP  = (pType == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                                                    : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double profitDist = (pType == POSITION_TYPE_BUY) ? (curP - openP) : (openP - curP);
-      if(profitDist <= 0) continue; // 浮亏期间不动 SL
+      if(profitDist <= 0) continue;
       double profitATR = profitDist / atr;
 
-      // Stage 1: 保本 (V10 SP-05 + SP-06 — 修复 §1.5 「浮盈 44USD 未保本」)
-      // SP-06: 黄金高点差时动态抬升 BE 触发阈值, 避免在"显示盈利但实际净亏"区间锁死
-      double beTrigger = InpBO_BE_TriggerATR;
-      if(InpBO_BE_DynamicByATR) {
+      double beTrigger = beTrig;
+      if(useDynBE) {
          double spreadATR = GetSpreadATRRatio_Zeus();
-         double dynTrigger = 2.0 * spreadATR;     // 至少 2× 点差才有意义
+         double dynTrigger = 2.0 * spreadATR;
          if(dynTrigger > beTrigger) beTrigger = dynTrigger;
       }
       if(!g_boStates[i].beMoved && profitATR >= beTrigger) {
-         // SP-05: BE 价 = 开仓价 ± 1× 点差 (确保净保本而非账面保本)
          double spreadBuf = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
          double be = (pType == POSITION_TYPE_BUY) ? openP + spreadBuf : openP - spreadBuf;
          if(ModifyPositionSL(tk, be)) {
             g_boStates[i].beMoved = true;
-            PrintFormat("🛡 [BO] ticket=%I64u 保本 @ %.5f (profitATR=%.2f trig=%.2f spread_buf=%.2f)",
-                        tk, be, profitATR, beTrigger, spreadBuf);
+            PrintFormat("🛡 [BO/%s] ticket=%I64u 保本 @ %.5f (profitATR=%.2f trig=%.2f)",
+                        ExitProfileText(prof), tk, be, profitATR, beTrigger);
          }
       }
-      // Stage 2: 追踪止损
-      if(profitATR >= InpBO_TrailStartATR) {
+      if(profitATR >= trailStart) {
          g_boStates[i].trailActive = true;
          if(profitATR > g_boStates[i].peakProfitATR) g_boStates[i].peakProfitATR = profitATR;
-         double trailDist = atr * InpBO_TrailDistATR;
-         double newSL = (pType == POSITION_TYPE_BUY) ? curP - trailDist : curP + trailDist;
+         double trailDistPrice = atr * trailDist;
+         double newSL = (pType == POSITION_TYPE_BUY) ? curP - trailDistPrice : curP + trailDistPrice;
          double curSL = PositionGetDouble(POSITION_SL);
-         // 推进步长检查 (避免高频小幅修改)
-         double stepDist = atr * InpBO_TrailStepATR;
+         double stepDist = atr * trailStep;
          bool shouldUpdate = false;
          if(curSL == 0) shouldUpdate = true;
          else if(pType == POSITION_TYPE_BUY  && newSL - curSL >= stepDist) shouldUpdate = true;
          else if(pType == POSITION_TYPE_SELL && curSL - newSL >= stepDist) shouldUpdate = true;
          if(shouldUpdate) {
             if(ModifyPositionSL(tk, newSL)) {
-               PrintFormat("📈 [BO] ticket=%I64u 追踪 SL→%.5f (peak %.2f ATR)",
-                           tk, newSL, g_boStates[i].peakProfitATR);
+               PrintFormat("📈 [BO/%s] ticket=%I64u 追踪 SL→%.5f (peak %.2f ATR)",
+                           ExitProfileText(prof), tk, newSL, g_boStates[i].peakProfitATR);
             }
          }
       }
@@ -2275,8 +2524,9 @@ void UpdateDashboard() {
                   : (g_currentRoute == ROUTE_BREAKOUT) ? clrAqua
                   : clrLightGreen;
    CreateLabel("V8_Route", y,
-               StringFormat("路由: %s | Donch=%.2f%%",
-                            RouteText(g_currentRoute), GetDonchianWidthPct()),
+               StringFormat("路由: %s | 手数×%.1f | %s",
+                            RouteText(g_currentRoute), GetRouteLotMult(),
+                            ExitProfileText(GetExitProfileForRoute(g_currentRoute))),
                routeClr); y += dy;
    CreateLabel("V8_Acct", y,
                StringFormat("权益 $%.2f | 回撤 %.2f%% | 日亏 %.2f%%",
@@ -2440,9 +2690,10 @@ int OnInit() {
    ArrayResize(g_boStates, 0);
    SyncBOStates();
 
-   // 同步运行时开关初始值
-   g_runEnableGrid     = InpEnableGrid;
+   // 同步运行时开关: Q4 自动模式下面板默认 ON (用户可点 OFF 完全禁用网格)
+   g_runEnableGrid     = !InpGrid_HardDisable && (InpEnableGrid || InpGrid_AutoEnable);
    g_runEnableBreakout = InpEnableBreakout;
+   UpdateGridAutoAllowed_Zeus();
    g_runPaused         = false;
 
    CreateControlPanel();
@@ -2473,10 +2724,19 @@ int OnInit() {
                InpEnableP4States ? "ON (S01/S02/S05/S06/S08/S10/S11)" : "OFF",
                InpGap_ATR_Mult, InpLowVol_ATRRatio,
                InpPreBreakout_LowBars, InpPreBreakout_LowRatio, InpPreBreakout_NowRatio);
-   Print("📖 设计规格: 宙斯_开发文档.md v0.8 | P0~P4 已完成 (全 12 类状态 + 路由表)");
+   PrintFormat("🎯 P5/P6: 出场 Profile A/B/C | 手数 LIGHT×%.1f FOLLOW×%.1f | MaxChase %s",
+               InpExitLight_LotMult, InpExitFollow_LotMult,
+               InpAdaptiveMaxChase ? "自适应 ON" : "固定");
+   PrintFormat("📊 Q4 网格: Auto=%s | spread≤%.2f/%.2f | H1_ADX<%.1f | 强制常开=%s | 硬禁=%s",
+               InpGrid_AutoEnable ? "ON" : "OFF",
+               InpGrid_AutoSpreadATR, InpGrid_AutoSpreadATR_Narrow,
+               InpGrid_AutoH1_ADXMax,
+               InpEnableGrid ? "是" : "否", InpGrid_HardDisable ? "是" : "否");
+   Print("📖 设计规格: 宙斯_开发文档.md v0.9 | P0~P6 已完成");
 
-   // V10 P4 修复 v3: 启动时先彻底清除所有残留 dashboard 对象 (旧 BACK 属性可能仍是 false)
-   // 然后立即重新创建一次, 用户启动后立刻可见
+   g_effectiveMaxChaseATR = InpAdaptiveMaxChase ? InpBO_TF_BaseChase : InpBO_TF_MaxChaseATR;
+   RefreshAdaptiveMaxChase_Zeus();
+
    DeleteDashboard();
    UpdateDashboard();
    ChartRedraw(0);
@@ -2576,7 +2836,9 @@ void OnTick() {
       return;
    }
 
-   // 7) V10 P3: 通过策略路由表分发引擎
+   // 7) V10 P3+P5: 策略路由表分发
+   RefreshAdaptiveMaxChase_Zeus();
+   UpdateGridAutoAllowed_Zeus();
    string routeReason;
    g_currentRoute = ResolveRoute_Zeus(routeReason);
    g_currentRouteReason = routeReason;
@@ -2596,19 +2858,16 @@ void OnTick() {
          break;
 
       case ROUTE_BREAKOUT_LIGHT:
-         // P4 S02 爆发前夜: 借用 BREAKOUT 引擎, 仓位由 ManageBreakoutEngine 内部根据
-         // g_currentRoute 自适应缩仓 (0.5×) (后续 P5 优化, 当前阶段仅启用入场)
          ManageBreakoutEngine();
          break;
 
       case ROUTE_TREND_FOLLOW:
-         // P4 S05/S06 弱趋势: 仅趋势跟随入场, 不走 Donchian 突破
-         // 暂复用 ManageBreakoutEngine, 后续 P5 拆出独立分支
          ManageBreakoutEngine();
          break;
 
       case ROUTE_CLOSE_ONLY:
-         // P4 S01/S11: 仅平仓不开新仓, 已有持仓继续由 trailing/basket 看护
+         if(CountOurPositions(-1, ENG_BREAKOUT) > 0)
+            CloseEngine(ENG_BREAKOUT, StringFormat("路由=CLOSE_ONLY | %s", routeReason));
          g_lastBlockReason = StringFormat("路由=CLOSE_ONLY | %s", routeReason);
          break;
    }

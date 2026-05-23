@@ -1,0 +1,54 @@
+; ============================================================
+; 太极·夔牛 V8 Adaptive - 激进参数集
+; 适用: XAUUSD 黄金 / 高波动品种, M5 周期
+; 风格: 单笔风险 2%, 更密网格, 更早追踪, 收益与回撤双高
+; 警告: 仅用于参数敏感性对比, 实盘前务必先用 Default 验证
+; ============================================================
+
+InpMagic=20260522
+InpComment=KN_V8A
+InpEnableGrid=true
+InpEnableBreakout=true
+InpSlippagePoints=30
+
+InpRiskPercent=2.0
+InpFixedLotFallback=0.01
+InpMaxLotPerTrade=2.0
+InpMaxMarginUsedPct=70.0
+
+InpDailyLossLimitPct=8.0
+InpMaxDrawdownPct=20.0
+InpCircuitCooldownMin=720
+
+InpRegimeTF=16385
+InpADX_Period=14
+InpADX_RangeMax=18.0
+InpADX_TrendMin=23.0
+InpATR_Period=14
+InpATR_AvgLookback=20
+InpATR_HighVolMult=2.2
+InpRegimeMinHoldBars=1
+
+InpGrid_SpacingATR=0.4
+InpGrid_MaxLevels=8
+InpGrid_LotMultiplier=1.4
+InpGrid_SL_ATR_Mult=3.0
+InpGrid_TP_ATR_Mult=1.2
+InpGrid_BasketTP_USD=25.0
+InpGrid_BasketSL_Pct=4.0
+InpGrid_CooldownSec=15
+
+InpBO_Lookback=15
+InpBO_ATR_AccelMult=1.15
+InpBO_MaxSameSide=3
+InpBO_SL_ATR_Mult=1.8
+InpBO_BE_TriggerATR=0.8
+InpBO_TrailStartATR=1.5
+InpBO_TrailDistATR=1.2
+InpBO_TrailStepATR=0.25
+InpBO_CooldownSec=60
+
+InpMaxSpreadPoints=80.0
+InpUseSessionFilter=false
+InpSessionStartHour=8
+InpSessionEndHour=22
